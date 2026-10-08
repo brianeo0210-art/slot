@@ -26,6 +26,26 @@ jobs:
           apt-get install -y --no-install-recommends zip cmake
           curl -fsSL https://taskfile.dev/install.sh | sh -s -- -b /usr/local/bin
 
+      - name: Fetch Syncthing for the card
+        env:
+          ST_VERSION: v1.30.0
+        run: |
+          set -eu
+          base="https://github.com/syncthing/syncthing/releases/download/${ST_VERSION}"
+          tar_name="syncthing-linux-arm64-${ST_VERSION}.tar.gz"
+          mkdir -p vendor/syncthing-dl
+          cd vendor/syncthing-dl
+          curl -fsSL -o "$tar_name" "$base/$tar_name"
+          curl -fsSL -o sums.txt "$base/sha256sum.txt.asc"
+          want="$(grep " $tar_name\$" sums.txt | cut -d' ' -f1)"
+          test -n "$want"
+          echo "$want  $tar_name" | sha256sum -c -
+          tar -xzf "$tar_name"
+          cp "syncthing-linux-arm64-${ST_VERSION}/syncthing" ../syncthing
+          cp "syncthing-linux-arm64-${ST_VERSION}/LICENSE.txt" ../syncthing-LICENSE.txt
+          cd ..
+          file syncthing | grep -q aarch64
+
       - name: Build the tree
         run: task dist:device OUT="slot-${GITHUB_REF_NAME}"
 
@@ -36,6 +56,8 @@ jobs:
           file "$out/System/slot" | grep -q aarch64
           file "$out/System/mgba_libretro.so" | grep -q aarch64
           file "$out/System/gpsp_libretro.so" | grep -q aarch64
+          file "$out/System/syncthing" | grep -q aarch64
+          test -f "$out/System/licenses/syncthing-LICENSE.txt"
           test -x "$out/System/slot"
           gpsp_src_sha="$(cat vendor/gpsp-src.sha)"
           test -f "$out/System/licenses/gpsp-${gpsp_src_sha}.tar.gz"

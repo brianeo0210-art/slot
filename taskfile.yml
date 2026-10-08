@@ -291,6 +291,12 @@ tasks:
       - cp vendor/gpsp_libretro.so {{.OUT}}/System/
       - cp -r licenses {{.OUT}}/System/licenses
       - |
+        if [ -f vendor/syncthing ]; then
+          cp vendor/syncthing {{.OUT}}/System/syncthing
+          chmod +x {{.OUT}}/System/syncthing
+          cp vendor/syncthing-LICENSE.txt {{.OUT}}/System/licenses/syncthing-LICENSE.txt
+        fi
+      - |
         set -euo pipefail
         sha="$(cat vendor/gpsp-src.sha)"
         cp vendor/gpsp-src.tar.gz "{{.OUT}}/System/licenses/gpsp-${sha}.tar.gz"

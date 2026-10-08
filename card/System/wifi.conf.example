@@ -1,0 +1,13 @@
+# Slot sync: your home Wi-Fi.
+#
+# 1. Rename this file to  wifi.conf  (no .example, no .txt)
+# 2. Put your network name and password between the quotes below
+# 3. Keep the lines exactly as they are otherwise
+#
+# Wi-Fi is only used while Sync is turned on, and never during a game.
+# Use a 2.4 GHz or 5 GHz home network. Not a hotel / login-page network.
+
+network={
+    ssid="YOUR WIFI NAME"
+    psk="YOUR WIFI PASSWORD"
+}
