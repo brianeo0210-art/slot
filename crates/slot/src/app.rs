@@ -298,6 +298,7 @@ pub struct App {
     snapshot: Option<Box<dyn Snapshot>>,
     core: Core,
     colour_pending: Option<bool>,
+    sync_status: crate::sync_radio::SyncStatus,
     link_player: Option<u8>,
     platform: Platform,
     named_core: bool,
@@ -403,6 +404,7 @@ impl App {
             snapshot: None,
             core: Core::default(),
             colour_pending: None,
+            sync_status: crate::sync_radio::SyncStatus::Off,
             link_player: None,
             platform: Platform::default(),
             named_core: false,
@@ -621,8 +623,36 @@ impl App {
             QuickRow::FastForwardSound => Some(QuickValue::flag(self.state.ff_sound)),
             QuickRow::ColourCorrection => Some(QuickValue::flag(self.state.colour_correction)),
             QuickRow::Rumble => Some(QuickValue::flag(self.state.rumble)),
+            QuickRow::Sync => Some(self.sync_value()),
             QuickRow::DateTime | QuickRow::About => None,
         }
+    }
+
+    fn sync_value(&self) -> QuickValue {
+        use crate::sync_radio::SyncStatus;
+        if !self.state.sync {
+            return QuickValue::Off;
+        }
+        match self.sync_status {
+            SyncStatus::Off => QuickValue::On,
+            SyncStatus::Connecting => QuickValue::Connecting,
+            SyncStatus::Running => QuickValue::Syncing,
+            SyncStatus::NeedsWifi => QuickValue::NeedsWifi,
+            SyncStatus::CantConnect => QuickValue::CantConnect,
+            SyncStatus::NotInstalled => QuickValue::NotInstalled,
+        }
+    }
+
+    pub fn sync_wanted(&self) -> bool {
+        self.state.sync
+            && matches!(
+                self.phase,
+                Phase::Shelf | Phase::QuickMenu { .. } | Phase::About
+            )
+    }
+
+    pub fn set_sync_status(&mut self, status: crate::sync_radio::SyncStatus) {
+        self.sync_status = status;
     }
 
     pub fn set_quick_menu_faces(&mut self, faces: QuickMenuFaces) {
@@ -1195,7 +1225,8 @@ impl App {
             QuickRow::FastForward
             | QuickRow::FastForwardSound
             | QuickRow::ColourCorrection
-            | QuickRow::Rumble => {}
+            | QuickRow::Rumble
+            | QuickRow::Sync => {}
         }
     }
 
@@ -1215,6 +1246,7 @@ impl App {
                 self.colour_pending = Some(s.colour_correction);
             }
             QuickRow::Rumble => s.rumble = !s.rumble,
+            QuickRow::Sync => s.sync = !s.sync,
             QuickRow::DateTime | QuickRow::About => return,
         }
         self.persist();

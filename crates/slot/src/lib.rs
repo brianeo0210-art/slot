@@ -24,6 +24,7 @@ pub mod resample;
 pub mod rewind;
 pub mod root;
 pub mod session;
+pub mod sync_radio;
 pub mod thumb;
 pub mod video_mode;
 pub mod wallpaper;

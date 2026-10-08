@@ -26,6 +26,7 @@ pub struct Session {
     motor: u16,
     reloading: bool,
     driven: bool,
+    sync: crate::sync_radio::SyncRadio,
 }
 
 impl Session {
@@ -34,6 +35,7 @@ impl Session {
         if let Err(e) = sink.open(GBA_HZ) {
             eprintln!("slot: audio: {e}");
         }
+        let root_for_sync = root.clone();
         Session {
             app: App::boot(&root),
             root,
@@ -46,6 +48,7 @@ impl Session {
             motor: 0,
             reloading: false,
             driven: false,
+            sync: crate::sync_radio::SyncRadio::new(&root_for_sync),
         }
     }
 
@@ -240,6 +243,7 @@ impl Session {
         if let Some(sfx) = self.app.take_sfx() {
             self.play_sfx(sfx);
         }
+        self.sync_save_sync();
         self.sync_core();
         self.sync_reload();
         if !self.has_core() {
@@ -254,6 +258,17 @@ impl Session {
         self.sync_ff_hud();
         self.sync_rumble();
         self.sync_pad();
+    }
+
+    fn sync_save_sync(&mut self) {
+        let want = self.app.sync_wanted();
+        self.sync.set(want);
+        let status = if want {
+            self.sync.status()
+        } else {
+            crate::sync_radio::SyncStatus::Off
+        };
+        self.app.set_sync_status(status);
     }
 
     fn sync_rumble(&mut self) {
@@ -387,6 +402,7 @@ impl Session {
         self.app
             .set_video_mode(crate::video_mode::video_mode_for(&self.root, stem));
         self.app.set_link_loaded(serial);
+        self.sync.stop_now();
         let sav = persist::read_sav(&self.root, platform, stem);
         let start = persist::resume_for_start(
             &self.root,

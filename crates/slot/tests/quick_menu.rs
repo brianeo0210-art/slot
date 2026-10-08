@@ -113,6 +113,7 @@ fn up_and_down_move_the_bar_and_wrap_at_the_ends() {
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
         QuickRow::Rumble,
+        QuickRow::Sync,
         QuickRow::DateTime,
         QuickRow::About,
         QuickRow::FastForward,
@@ -519,4 +520,51 @@ fn only_the_clock_from_the_menu_offers_b_back() {
         !drawn(&out, 400),
         "the first boot clock offers a way back it does not have"
     );
+}
+
+#[test]
+fn save_sync_flips_on_either_arrow_saves_and_defaults_off() {
+    let (d, mut a, _) = on_carousel();
+    assert!(!read_slot_state(d.path()).sync);
+    open_at(&mut a, QuickRow::Sync);
+    assert_eq!(a.quick_value(QuickRow::Sync), Some(QuickValue::Off));
+    assert!(!a.sync_wanted());
+    press(&mut a, Btn::Right);
+    assert!(read_slot_state(d.path()).sync);
+    assert_eq!(a.quick_value(QuickRow::Sync), Some(QuickValue::On));
+    assert!(a.sync_wanted(), "on the shelf with sync on, sync is wanted");
+    press(&mut a, Btn::Left);
+    assert!(!read_slot_state(d.path()).sync);
+    assert!(!a.sync_wanted());
+}
+
+#[test]
+fn save_sync_shows_what_the_script_reports_only_while_on() {
+    use slot::sync_radio::SyncStatus;
+    let (_d, mut a, _) = on_carousel();
+    open_at(&mut a, QuickRow::Sync);
+    a.set_sync_status(SyncStatus::Running);
+    assert_eq!(a.quick_value(QuickRow::Sync), Some(QuickValue::Off));
+    press(&mut a, Btn::Right);
+    for (status, want) in [
+        (SyncStatus::Connecting, QuickValue::Connecting),
+        (SyncStatus::Running, QuickValue::Syncing),
+        (SyncStatus::NeedsWifi, QuickValue::NeedsWifi),
+        (SyncStatus::CantConnect, QuickValue::CantConnect),
+        (SyncStatus::NotInstalled, QuickValue::NotInstalled),
+        (SyncStatus::Off, QuickValue::On),
+    ] {
+        a.set_sync_status(status);
+        assert_eq!(a.quick_value(QuickRow::Sync), Some(want));
+    }
+}
+
+#[test]
+fn a_saved_sync_choice_survives_a_reboot() {
+    let (d, mut a, _) = on_carousel();
+    open_at(&mut a, QuickRow::Sync);
+    press(&mut a, Btn::Right);
+    drop(a);
+    let (a, _) = app_booting_at(d.path(), CLOCK_IS_SET);
+    assert!(a.sync_wanted());
 }

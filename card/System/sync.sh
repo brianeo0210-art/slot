@@ -24,6 +24,7 @@ WAIT_IP="${SYNC_WAIT_IP:-60}"
 
 STATE="$RUN/slot-sync.state"
 PIDF="$RUN/slot-sync.pid"
+WANT="$RUN/slot-sync.want"
 IDF="$RUN/slot-sync.id"
 LOG="$SD/sync.log"
 PEER_FILE="$SD/Config/sync_peer.txt"
@@ -96,6 +97,7 @@ start() {
 	[ -x "$ST" ] || [ -f "$ST" ] || { say no-binary; return 1; }
 	[ -f "$SYS/wifi.conf" ] || { say no-wifi; return 1; }
 	say starting
+	: > "$WANT"
 	pick_home
 
 	if ! has_ip; then
@@ -107,6 +109,7 @@ start() {
 		done
 		has_ip || { say no-ip; return 1; }
 	fi
+	[ -f "$WANT" ] || return 1
 
 	if [ ! -f "$H/config.xml" ]; then
 		"$ST" generate --home "$H" --no-default-folder >/dev/null 2>&1 \
@@ -146,6 +149,7 @@ start() {
 }
 
 stop() {
+	rm -f "$WANT"
 	if running; then
 		pid="$(cat "$PIDF")"
 		kill "$pid" 2>/dev/null

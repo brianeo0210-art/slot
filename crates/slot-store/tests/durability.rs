@@ -192,6 +192,7 @@ fn a_card_from_before_the_settings_keeps_all_its_values() {
             ff_speed: FF_SPEED_DEFAULT,
             ff_sound: false,
             colour_correction: false,
+            sync: false,
         }
     );
 }
@@ -205,6 +206,7 @@ fn the_quick_menu_settings_round_trip_as_their_own_lines() {
         ff_speed: 2,
         ff_sound: true,
         colour_correction: true,
+        sync: true,
         ..SlotState::default()
     };
     write_slot_state(d.path(), &s).unwrap();
@@ -215,6 +217,7 @@ fn the_quick_menu_settings_round_trip_as_their_own_lines() {
         "ff_speed=2",
         "ff_sound=1",
         "colour_correction=1",
+        "sync=1",
     ] {
         assert!(text.lines().any(|l| l == line), "no {line} in {text:?}");
     }

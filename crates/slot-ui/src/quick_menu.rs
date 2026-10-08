@@ -10,16 +10,18 @@ pub enum QuickRow {
     FastForwardSound,
     ColourCorrection,
     Rumble,
+    Sync,
     DateTime,
     About,
 }
 
 impl QuickRow {
-    pub const ALL: [QuickRow; 6] = [
+    pub const ALL: [QuickRow; 7] = [
         QuickRow::FastForward,
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
         QuickRow::Rumble,
+        QuickRow::Sync,
         QuickRow::DateTime,
         QuickRow::About,
     ];
@@ -34,6 +36,7 @@ impl QuickRow {
             QuickRow::FastForwardSound => "Fast Forward Sound",
             QuickRow::ColourCorrection => "Colour Correction",
             QuickRow::Rumble => "Rumble",
+            QuickRow::Sync => "Save Sync",
             QuickRow::DateTime => "Date & Time",
             QuickRow::About => "About",
         }
@@ -61,16 +64,26 @@ pub enum QuickValue {
     Speed6,
     On,
     Off,
+    Connecting,
+    Syncing,
+    NeedsWifi,
+    CantConnect,
+    NotInstalled,
 }
 
 impl QuickValue {
-    pub const ALL: [QuickValue; 6] = [
+    pub const ALL: [QuickValue; 11] = [
         QuickValue::Speed2,
         QuickValue::Speed3,
         QuickValue::Speed4,
         QuickValue::Speed6,
         QuickValue::On,
         QuickValue::Off,
+        QuickValue::Connecting,
+        QuickValue::Syncing,
+        QuickValue::NeedsWifi,
+        QuickValue::CantConnect,
+        QuickValue::NotInstalled,
     ];
 
     pub fn index(self) -> usize {
@@ -85,6 +98,11 @@ impl QuickValue {
             QuickValue::Speed6 => "6×",
             QuickValue::On => "On",
             QuickValue::Off => "Off",
+            QuickValue::Connecting => "Connecting",
+            QuickValue::Syncing => "Syncing",
+            QuickValue::NeedsWifi => "Needs wifi.conf",
+            QuickValue::CantConnect => "Can't connect",
+            QuickValue::NotInstalled => "Not installed",
         }
     }
 
@@ -107,7 +125,7 @@ impl QuickValue {
     }
 }
 
-pub const QUICK_PITCH: f32 = 52.0;
+pub const QUICK_PITCH: f32 = 48.0;
 pub const QUICK_TOP: f32 = (OUT_H as f32 - QUICK_PITCH * QuickRow::ALL.len() as f32) / 2.0;
 pub const QUICK_EDGE: f32 = 32.0;
 const BAR_INSET: f32 = 4.0;
