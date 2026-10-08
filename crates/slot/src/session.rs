@@ -387,9 +387,17 @@ impl Session {
         self.app
             .set_video_mode(crate::video_mode::video_mode_for(&self.root, stem));
         self.app.set_link_loaded(serial);
-        let resume = (!self.app.starting_clean())
-            .then(|| persist::read_resume(&self.root, platform, core, stem))
-            .flatten();
+        let sav = persist::read_sav(&self.root, platform, stem);
+        let start = persist::resume_for_start(
+            &self.root,
+            platform,
+            core,
+            stem,
+            sav.as_deref(),
+            self.app.starting_clean(),
+            &slot_store::stamp_now(),
+        );
+        let resume = start.resume;
         let player = self.app.link_player();
         let opened = open_core(
             &self.root,
@@ -399,7 +407,6 @@ impl Session {
             player,
         );
         self.app.set_named_core(opened.named);
-        let sav = persist::read_sav(&self.root, platform, stem);
         let ring = self.sink.ring();
         let emu = match player.filter(|_| platform == Platform::Gba) {
             Some(p) => EmuHandle::spawn_linked(opened.core, rom, ring, sav, resume, p),

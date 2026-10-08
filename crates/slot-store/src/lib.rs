@@ -7,6 +7,7 @@ mod gba;
 pub mod ini;
 mod platform;
 mod ring;
+pub mod save_seen;
 mod scan;
 mod slot_state;
 mod stamp;

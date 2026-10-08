@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use slot_store::save_seen::{self, SaveSeen};
 use slot_store::{atomic_write, read_slot_state, write_slot_state, Core, Platform, StateRing};
 
 pub trait Snapshot {
@@ -53,6 +54,7 @@ pub fn write_sav(root: &Path, platform: Platform, stem: &str, sav: &[u8]) -> std
     let path = sav_path(root, platform, stem);
     if let Some(old) = read_sav(root, platform, stem) {
         if old == sav {
+            note_save(root, platform, stem, sav);
             return Ok(false);
         }
     }
@@ -60,7 +62,62 @@ pub fn write_sav(root: &Path, platform: Platform, stem: &str, sav: &[u8]) -> std
         std::fs::create_dir_all(dir)?;
     }
     atomic_write(&path, sav)?;
+    note_save(root, platform, stem, sav);
     Ok(true)
+}
+
+fn note_save(root: &Path, platform: Platform, stem: &str, sav: &[u8]) {
+    if save_seen::check(root, platform, stem, sav) == SaveSeen::Same {
+        return;
+    }
+    if let Err(e) = save_seen::record(root, platform, stem, sav) {
+        eprintln!("slot: save_seen: {stem}: {e}");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Start {
+    pub resume: Option<Vec<u8>>,
+    pub edited_elsewhere: bool,
+}
+
+pub fn resume_for_start(
+    root: &Path,
+    platform: Platform,
+    core: Core,
+    stem: &str,
+    sav: Option<&[u8]>,
+    clean: bool,
+    stamp: &str,
+) -> Start {
+    let edited_elsewhere = sav.is_some_and(|bytes| {
+        let verdict = save_seen::check(root, platform, stem, bytes);
+        note_save(root, platform, stem, bytes);
+        verdict == SaveSeen::Changed
+    });
+    if edited_elsewhere {
+        match StateRing::new(root, platform, core, stem).retire_resume(stamp) {
+            Ok(Some(to)) => eprintln!(
+                "slot: {stem}: the save was changed outside slot, resume kept as {}",
+                to.display()
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!("slot: {stem}: could not set the resume aside: {e}"),
+        }
+        return Start {
+            resume: None,
+            edited_elsewhere,
+        };
+    }
+    let resume = if clean {
+        None
+    } else {
+        read_resume(root, platform, core, stem)
+    };
+    Start {
+        resume,
+        edited_elsewhere,
+    }
 }
 
 pub fn read_sav(root: &Path, platform: Platform, stem: &str) -> Option<Vec<u8>> {
