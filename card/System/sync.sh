@@ -30,7 +30,9 @@ LOG="$SD/sync.log"
 PEER_FILE="$SD/Config/sync_peer.txt"
 ID_FILE="$SD/Config/sync_id.txt"
 
-say() { echo "$1" > "$STATE" 2>/dev/null; }
+DBG="$SD/sync-debug.log"
+dbg() { echo "$(date '+%H:%M:%S') $*" >> "$DBG" 2>/dev/null; }
+say() { echo "$1" > "$STATE" 2>/dev/null; dbg "state: $1"; }
 
 # Where Syncthing keeps its identity and database. /data survives card swaps, so
 # the pairing does too. A card with no writable /data keeps it on the card.
@@ -91,6 +93,7 @@ apply_peer_file() {
 }
 
 start() {
+	dbg "start requested"
 	if running; then
 		return 0
 	fi
@@ -101,7 +104,9 @@ start() {
 	pick_home
 
 	if ! has_ip; then
-		"$NETCTL" wifi >/dev/null 2>&1
+		dbg "joining wifi with $NETCTL"
+		"$NETCTL" wifi >> "$DBG" 2>&1
+		dbg "ags-net wifi returned $?; ip: $($IPBIN -4 addr show wlan0 2>&1 | grep inet)"
 		n=0
 		while ! has_ip && [ "$n" -lt "$WAIT_IP" ]; do
 			sleep 1
@@ -111,7 +116,9 @@ start() {
 	fi
 	[ -f "$WANT" ] || return 1
 
+	dbg "have ip, home $H"
 	if [ ! -f "$H/config.xml" ]; then
+		dbg "generating keys"
 		"$ST" generate --home "$H" --no-default-folder >/dev/null 2>&1 \
 			|| "$ST" generate --home "$H" >/dev/null 2>&1
 		# Home network only: no global discovery, relays or router port mapping.
@@ -125,6 +132,7 @@ start() {
 	fi
 
 	[ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+	dbg "starting syncthing"
 	"$ST" serve --no-browser --no-restart --gui-address=127.0.0.1:8384 \
 		> "$LOG" 2>&1 &
 	echo $! > "$PIDF"
@@ -137,6 +145,7 @@ start() {
 		sleep 1
 	done
 
+	dbg "syncthing api is up"
 	first_time_setup || { say error; return 1; }
 	apply_peer_file
 
