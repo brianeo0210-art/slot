@@ -92,6 +92,52 @@ apply_peer_file() {
 	done
 }
 
+# What this system has, written once per start so a failure can be diagnosed.
+inventory() {
+	dbg "net devices: $(ls /sys/class/net 2>&1 | tr '\n' ' ')"
+	for t in wpa_supplicant wpa_cli udhcpc ip insmod rfkill; do
+		dbg "tool $t: $(command -v $t 2>&1 || echo missing)"
+	done
+	dbg "modules: $(ls /lib/modules 2>&1 | head -5 | tr '\n' ' ')"
+	dbg "loaded: $(grep -c . /proc/modules 2>&1) $(grep -i '8821\|rtw\|wlan' /proc/modules 2>&1 | cut -d' ' -f1 | tr '\n' ' ')"
+}
+
+# Wi-Fi on a system that has no ags-net: the same steps, from the card's file.
+join_wifi() {
+	n=0
+	while [ ! -d /sys/class/net/wlan0 ] && [ "$n" -lt 20 ]; do
+		if [ "$n" -eq 0 ] && [ -f /lib/modules/8821cs.ko ] && ! grep -q '^8821cs ' /proc/modules 2>/dev/null; then
+			dbg "insmod 8821cs"
+			insmod /lib/modules/8821cs.ko >> "$DBG" 2>&1
+		fi
+		sleep 1
+		n=$((n + 1))
+	done
+	[ -d /sys/class/net/wlan0 ] || { dbg "no wlan0"; return 1; }
+	rfkill unblock wifi 2>/dev/null
+	$IPBIN link set wlan0 up 2>/dev/null
+	CTRL=/var/run/wpa_supplicant
+	mkdir -p "$CTRL"
+	if grep -q '^ctrl_interface=' "$SYS/wifi.conf" 2>/dev/null; then
+		cp "$SYS/wifi.conf" "$RUN/wpa_supplicant.conf"
+	else
+		{ echo "ctrl_interface=$CTRL"; cat "$SYS/wifi.conf"; } > "$RUN/wpa_supplicant.conf"
+	fi
+	chmod 600 "$RUN/wpa_supplicant.conf" 2>/dev/null
+	$WPA_CLI -i wlan0 terminate >/dev/null 2>&1
+	wpa_supplicant -B -i wlan0 -c "$RUN/wpa_supplicant.conf" -Dnl80211 >> "$DBG" 2>&1 \
+		|| { dbg "wpa_supplicant would not start"; return 1; }
+	n=0
+	while [ "$n" -lt 40 ]; do
+		$WPA_CLI -i wlan0 status 2>/dev/null | grep -q '^wpa_state=COMPLETED' && break
+		sleep 1
+		n=$((n + 1))
+	done
+	dbg "wpa state: $($WPA_CLI -i wlan0 status 2>&1 | grep wpa_state)"
+	udhcpc -i wlan0 -n -q -t 8 >> "$DBG" 2>&1
+	dbg "udhcpc returned $?"
+}
+
 start() {
 	dbg "start requested"
 	if running; then
@@ -104,9 +150,15 @@ start() {
 	pick_home
 
 	if ! has_ip; then
-		dbg "joining wifi with $NETCTL"
-		"$NETCTL" wifi >> "$DBG" 2>&1
-		dbg "ags-net wifi returned $?; ip: $($IPBIN -4 addr show wlan0 2>&1 | grep inet)"
+		inventory
+		if [ -x "$NETCTL" ]; then
+			dbg "joining wifi with $NETCTL"
+			"$NETCTL" wifi >> "$DBG" 2>&1
+			dbg "ags-net wifi returned $?"
+		else
+			join_wifi
+		fi
+		dbg "ip: $($IPBIN -4 addr show wlan0 2>&1 | grep inet)"
 		n=0
 		while ! has_ip && [ "$n" -lt "$WAIT_IP" ]; do
 			sleep 1
