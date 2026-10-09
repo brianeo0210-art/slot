@@ -26,11 +26,13 @@ STATE="$RUN/slot-sync.state"
 PIDF="$RUN/slot-sync.pid"
 WANT="$RUN/slot-sync.want"
 IDF="$RUN/slot-sync.id"
-LOG="$SD/sync.log"
+LOGS="$SD/Logs"
+LOG="$LOGS/sync.log"
 PEER_FILE="$SD/Config/sync_peer.txt"
 ID_FILE="$SD/Config/sync_id.txt"
 
-DBG="$SD/sync-debug.log"
+DBG="$LOGS/sync-debug.log"
+mkdir -p "$LOGS" 2>/dev/null
 dbg() { echo "$(date '+%H:%M:%S') $*" >> "$DBG" 2>/dev/null; }
 say() { echo "$1" > "$STATE" 2>/dev/null; dbg "state: $1"; }
 
