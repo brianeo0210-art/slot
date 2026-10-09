@@ -73,14 +73,17 @@ ids_in() {
 share_with() {
 	peer="$1"
 	[ -n "$peer" ] || return 0
-	st_cli config devices add --device-id "$peer" --name "Thor" >/dev/null 2>&1 || true
-	st_cli config folders "$FOLDER_ID" devices add --device-id "$peer" >/dev/null 2>&1 || true
+	dbg "sharing with $peer"
+	st_cli config devices add --device-id "$peer" --name "Thor" >> "$DBG" 2>&1
+	dbg "devices add returned $?"
+	st_cli config folders "$FOLDER_ID" devices add --device-id "$peer" >> "$DBG" 2>&1
+	dbg "folder share returned $?"
 }
 
 first_time_setup() {
 	[ -f "$H/.slot-configured" ] && return 0
 	st_cli config folders add --id "$FOLDER_ID" --label "Slot Saves" --path "$SD/Saves" \
-		>/dev/null 2>&1 || return 1
+		>> "$DBG" 2>&1 || { dbg "folder add failed"; return 1; }
 	: > "$H/.slot-configured"
 }
 
@@ -200,6 +203,9 @@ start() {
 	dbg "syncthing api is up"
 	first_time_setup || { say error; return 1; }
 	apply_peer_file
+	dbg "folders: $(st_cli config folders list 2>&1 | tr '\n' ' ')"
+	dbg "devices: $(st_cli config devices list 2>&1 | tr '\n' ' ')"
+	dbg "folder devices: $(st_cli config folders "$FOLDER_ID" devices list 2>&1 | tr '\n' ' ')"
 
 	id="$(device_id)"
 	if [ -n "$id" ]; then
