@@ -77,21 +77,49 @@ fn the_fast_forward_row_offers_the_four_ceilings_the_card_can_hold() {
 
 #[test]
 fn the_rows_run_in_the_order_the_user_chose() {
-    let labels = QuickRow::ALL.map(QuickRow::label);
     assert_eq!(
-        labels,
+        QuickRow::MAIN.map(QuickRow::label),
+        ["Screen", "Gameplay", "Save Sync", "Date & Time", "About"]
+    );
+    assert_eq!(
+        QuickRow::SCREEN.map(QuickRow::label),
+        [
+            "GBA Shader",
+            "GB / GBC Shader",
+            "Color Correction",
+            "GB Palettes"
+        ]
+    );
+    assert_eq!(
+        QuickRow::GAME.map(QuickRow::label),
         [
             "Fast Forward",
             "Fast Forward Sound",
-            "Colour Correction",
+            "Rewind",
+            "Turbo Buttons",
             "Rumble",
-            "Save Sync",
-            "Date & Time",
-            "About"
+            "Auto Save on Eject"
         ]
     );
     let opens: Vec<QuickRow> = QuickRow::ALL.into_iter().filter(|r| r.opens()).collect();
-    assert_eq!(opens, [QuickRow::DateTime, QuickRow::About]);
+    assert_eq!(
+        opens,
+        [
+            QuickRow::Screen,
+            QuickRow::DateTime,
+            QuickRow::About,
+            QuickRow::Game
+        ]
+    );
+    for page in [
+        &QuickRow::MAIN[..],
+        &QuickRow::SCREEN[..],
+        &QuickRow::GAME[..],
+    ] {
+        for &row in page {
+            assert_eq!(row.page(), page, "{row:?}");
+        }
+    }
 }
 
 #[test]
@@ -105,6 +133,10 @@ fn the_values_read_as_the_menu_prints_them() {
             "6×",
             "On",
             "Off",
+            "LCD3x",
+            "Grid",
+            "Dot",
+            "Simpletex",
             "Connecting",
             "Syncing",
             "Needs wifi.conf",
