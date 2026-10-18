@@ -390,6 +390,7 @@ pub struct LibretroCore {
     rom_path: Option<CString>,
     av: AvInfo,
     loaded: bool,
+    state_size: Option<usize>,
     _lib: Library,
 }
 
@@ -505,6 +506,7 @@ impl LibretroCore {
                 sample_rate: 0.0,
             },
             loaded: false,
+            state_size: None,
             _lib: lib,
         })
     }
@@ -516,6 +518,33 @@ impl LibretroCore {
         let _a = Active::bind(&mut self.host);
         unsafe { (self.api.unload_game)() };
         self.loaded = false;
+    }
+
+    fn serialize_at(&mut self, size: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; size];
+        let ok = {
+            let _a = Active::bind(&mut self.host);
+            unsafe { (self.api.serialize)(buf.as_mut_ptr() as *mut c_void, size) }
+        };
+        ok.then_some(buf)
+    }
+
+    fn memory(&self, id: c_uint) -> Option<&[u8]> {
+        let data = unsafe { (self.api.get_memory_data)(id) };
+        let len = unsafe { (self.api.get_memory_size)(id) };
+        if data.is_null() || len == 0 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(data as *const u8, len) })
+    }
+
+    fn memory_mut(&mut self, id: c_uint) -> Option<&mut [u8]> {
+        let data = unsafe { (self.api.get_memory_data)(id) };
+        let len = unsafe { (self.api.get_memory_size)(id) };
+        if data.is_null() || len == 0 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts_mut(data as *mut u8, len) })
     }
 }
 
@@ -537,6 +566,7 @@ impl RetroCore for LibretroCore {
 
     fn load(&mut self, rom: &Path) -> Result<(), CoreError> {
         self.unload();
+        self.state_size = None;
         self.rom = std::fs::read(rom)?;
         self.rom_path = Some(
             CString::new(rom.as_os_str().as_encoded_bytes())
@@ -595,20 +625,16 @@ impl RetroCore for LibretroCore {
     }
 
     fn serialize(&mut self) -> Result<Vec<u8>, CoreError> {
+        if let Some(buf) = self.state_size.and_then(|size| self.serialize_at(size)) {
+            return Ok(buf);
+        }
         let size = unsafe { (self.api.serialize_size)() };
+        self.state_size = (size > 0).then_some(size);
         if size == 0 {
             return Err(CoreError::State("core reports no state".into()));
         }
-        let mut buf = vec![0u8; size];
-        let ok = {
-            let _a = Active::bind(&mut self.host);
-            unsafe { (self.api.serialize)(buf.as_mut_ptr() as *mut c_void, size) }
-        };
-        if ok {
-            Ok(buf)
-        } else {
-            Err(CoreError::State("serialize refused".into()))
-        }
+        self.serialize_at(size)
+            .ok_or_else(|| CoreError::State("serialize refused".into()))
     }
 
     fn unserialize(&mut self, data: &[u8]) -> Result<(), CoreError> {
@@ -624,22 +650,24 @@ impl RetroCore for LibretroCore {
     }
 
     fn save_ram(&self) -> Option<Vec<u8>> {
-        let data = unsafe { (self.api.get_memory_data)(MEMORY_SAVE_RAM) };
-        let len = unsafe { (self.api.get_memory_size)(MEMORY_SAVE_RAM) };
-        if data.is_null() || len == 0 {
-            return None;
+        let mut sav = self.memory(MEMORY_SAVE_RAM)?.to_vec();
+        if let Some(rtc) = self.memory(MEMORY_RTC) {
+            sav.extend_from_slice(rtc);
         }
-        Some(unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec())
+        Some(sav)
     }
 
     fn load_save_ram(&mut self, data: &[u8]) -> Result<(), CoreError> {
-        let dst = unsafe { (self.api.get_memory_data)(MEMORY_SAVE_RAM) };
-        let len = unsafe { (self.api.get_memory_size)(MEMORY_SAVE_RAM) };
-        if dst.is_null() || len == 0 {
+        let Some(ram) = self.memory_mut(MEMORY_SAVE_RAM) else {
             return Err(CoreError::Unsupported("core exposes no save ram".into()));
+        };
+        let n = ram.len().min(data.len());
+        ram[..n].copy_from_slice(&data[..n]);
+        let rest = &data[n..];
+        if let Some(rtc) = self.memory_mut(MEMORY_RTC) {
+            let m = rtc.len().min(rest.len());
+            rtc[..m].copy_from_slice(&rest[..m]);
         }
-        let n = len.min(data.len());
-        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, n) };
         Ok(())
     }
 

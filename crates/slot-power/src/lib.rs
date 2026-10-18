@@ -4,14 +4,14 @@ mod power;
 mod sim;
 
 pub use device::{
-    has_bit, motor_change, record_first_frame, rumble_node, trace_first_frame, uptime_seconds,
-    DevicePlatform,
+    card_kernel_lines, has_bit, motor_change, read_only, read_only_in, record_first_frame,
+    rumble_node, trace_first_frame, uptime_seconds, DevicePlatform,
 };
 pub use motor::Motor;
 pub use power::Power;
 pub use sim::SimPlatform;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -55,6 +55,18 @@ pub trait Platform: Send {
 
     fn headphones(&self) -> bool {
         false
+    }
+
+    fn card_read_only(&self) -> bool {
+        false
+    }
+
+    fn card_log(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn card_kernel_lines(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

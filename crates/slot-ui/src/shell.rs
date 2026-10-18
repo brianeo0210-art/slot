@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use slot_store::gb::Class;
 use slot_store::{Cart, Platform, ShellFinish};
@@ -86,9 +88,24 @@ pub fn shell_for(cart: &Cart) -> Shell {
         return shell(choice.colour, finish);
     }
     match cart.platform {
-        Platform::Gba => gba_shell_for(&cart.code),
+        Platform::Gba => gba_shell_for(&gba_code(cart)),
         Platform::Gb | Platform::Gbc => gb_shell_for(&cart.rom),
     }
+}
+
+fn gba_code(cart: &Cart) -> String {
+    if !cart.code.is_empty() {
+        return cart.code.clone();
+    }
+    static CODES: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    let mut codes = CODES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    codes
+        .entry(cart.rom.clone())
+        .or_insert_with(|| slot_store::header_code(&cart.rom).unwrap_or_default())
+        .clone()
 }
 
 pub fn gba_shell_for(code: &str) -> Shell {
@@ -96,7 +113,7 @@ pub fn gba_shell_for(code: &str) -> Shell {
 }
 
 fn gb_shell_for(rom: &Path) -> Shell {
-    let Some(h) = slot_store::gb::header(rom) else {
+    let Some(h) = slot_store::gb::cached_header(rom) else {
         return flag_shell(slot_store::gb::class(rom));
     };
     let by_title = || {
@@ -120,6 +137,37 @@ fn flag_shell(class: Class) -> Shell {
 
 pub fn table_keys() -> Vec<&'static str> {
     EXACT.iter().map(|(k, _)| *k).collect()
+}
+
+pub fn gba_plastics() -> Vec<[u8; 3]> {
+    let mut colours = vec![DEFAULT_SHELL.colour, FAMILY[0].1.colour];
+    colours.extend(EXACT.iter().map(|(_, s)| s.colour));
+    unique(colours)
+}
+
+pub fn gb_plastics() -> Vec<[u8; 3]> {
+    let mut colours = vec![
+        DMG_SHELL.colour,
+        DUAL_MODE_SHELL.colour,
+        GB_CLEAR_SHELL.colour,
+    ];
+    colours.extend(
+        GB_CODES
+            .iter()
+            .chain(GB_OVERSEAS_TITLES)
+            .map(|(_, s)| s.colour),
+    );
+    unique(colours)
+}
+
+fn unique(colours: Vec<[u8; 3]>) -> Vec<[u8; 3]> {
+    let mut out = Vec::new();
+    for colour in colours {
+        if !out.contains(&colour) {
+            out.push(colour);
+        }
+    }
+    out
 }
 
 pub fn gb_table_shells() -> Vec<Shell> {

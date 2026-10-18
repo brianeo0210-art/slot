@@ -7,7 +7,7 @@ use common::{app_playing_in, app_playing_with, tmp_root_with_carts};
 use slot::app::Phase;
 use slot::persist;
 use slot::persist::Snapshot;
-use slot_input::{Action, Btn};
+use slot_input::Action;
 use slot_power::{Battery, Charge, LedState};
 use slot_store::{read_slot_state, Core, Platform, StateRing};
 
@@ -76,41 +76,24 @@ fn a_power_tap_dozes_and_a_second_one_wakes() {
 }
 
 #[test]
-fn opening_the_menu_flushes_and_the_choice_powers_off() {
+fn a_hold_flushes_and_powers_off_without_ejecting() {
     let d = tmp_root_with_carts(&["Emerald"]);
     let mut a = app_playing_in(d.path(), "Emerald");
 
     a.apply(Action::PowerHold);
-    assert!(
-        !a.powering_off(),
-        "the hold asks the question, it does not answer it"
-    );
+    assert!(a.powering_off(), "the hold did not power off");
     assert!(
         StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald")
             .read_resume()
             .unwrap()
             .is_some(),
-        "durable before the user has read a single row"
+        "the resume was not on the card before the shutdown began"
     );
-
-    a.apply(Action::GbaDown(Btn::Down));
-    a.apply(Action::GbaDown(Btn::A));
-    assert!(a.powering_off(), "Power Off is the second row");
     assert_eq!(
         read_slot_state(d.path()).cart,
         Some("Emerald".into()),
         "power off is not an eject"
     );
-}
-
-#[test]
-fn a_release_after_the_hold_does_nothing_on_its_own() {
-    let d = tmp_root_with_carts(&["Emerald"]);
-    let mut a = app_playing_in(d.path(), "Emerald");
-    a.apply(Action::PowerHold);
-    a.apply(Action::PowerOff);
-    assert!(!a.powering_off());
-    assert_eq!(a.power_menu(), Some(0), "and leaves the menu up");
 }
 
 #[test]
@@ -361,5 +344,70 @@ fn a_lid_close_right_after_an_autosave_leaves_the_lids_state() {
         state,
         vec![1u8; 64],
         "the autosave landed over the lid's save"
+    );
+}
+
+fn lock_the_card(root: &std::path::Path) {
+    let states = root.join("States");
+    let _ = std::fs::remove_dir_all(&states);
+    std::fs::write(&states, b"").unwrap();
+}
+
+#[test]
+fn an_autosave_the_card_refuses_puts_up_a_banner() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut a = app_playing_in(d.path(), "Emerald");
+    lock_the_card(d.path());
+    a.tick_ms(60_000);
+    a.settle_saves();
+    a.tick_ms(60_010);
+    assert!(a.card_alarm(), "a refused autosave raised no alarm");
+    a.tick_ms(3_600_000);
+    assert!(
+        a.card_alarm(),
+        "the alarm went away while the card still refused"
+    );
+}
+
+#[test]
+fn the_alarm_clears_once_the_card_takes_a_write_again() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut a = app_playing_in(d.path(), "Emerald");
+    lock_the_card(d.path());
+    a.tick_ms(60_000);
+    a.settle_saves();
+    a.tick_ms(60_010);
+    assert!(a.card_alarm());
+    std::fs::remove_file(d.path().join("States")).unwrap();
+    a.tick_ms(120_000);
+    a.settle_saves();
+    a.tick_ms(120_010);
+    assert!(!a.card_alarm(), "the alarm stayed after a write landed");
+}
+
+#[test]
+fn an_autosave_that_lands_puts_up_no_banner() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut a = app_playing_in(d.path(), "Emerald");
+    a.tick_ms(60_000);
+    a.settle_saves();
+    a.tick_ms(60_010);
+    assert!(!a.card_alarm());
+}
+
+#[test]
+fn a_card_the_kernel_made_read_only_raises_the_alarm_without_a_save() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let (mut a, read_only) = common::app_playing_with_card(d.path(), "Emerald");
+    a.tick_ms(1_000);
+    assert!(!a.card_alarm());
+    read_only.store(true, Ordering::Relaxed);
+    a.tick_ms(3_100);
+    assert!(a.card_alarm(), "a read-only card went unnoticed");
+    read_only.store(false, Ordering::Relaxed);
+    a.tick_ms(5_200);
+    assert!(
+        !a.card_alarm(),
+        "the alarm stayed once the card was writable"
     );
 }

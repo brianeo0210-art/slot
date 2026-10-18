@@ -6,15 +6,17 @@ use slot_retro::Rumble;
 use slot_store::Platform;
 use slot_ui::FfState;
 
-pub const RUMBLE_HOLD_MS: Millis = 100;
+pub const RUMBLE_MIN_MS: Millis = 100;
+pub const RUMBLE_MAX_MS: Millis = 150;
 
 use crate::app::{App, Phase};
-use crate::audio::{open_sink, AudioSink, Ring, Sfx, GBA_HZ};
+use crate::audio::{opened_sink, AudioSink, Ring, Sfx};
 use crate::core::open_core;
 use crate::emu::{CoreState, EmuHandle, Speed};
 use crate::frames::FrameRef;
 use crate::input::Pad;
 use crate::persist;
+use crate::prefetch::Prefetch;
 
 pub struct Session {
     root: PathBuf,
@@ -27,6 +29,7 @@ pub struct Session {
     fast: bool,
     motor: u16,
     pulse: Option<(Millis, u16)>,
+    prefetch: Prefetch,
     reloading: bool,
     driven: bool,
     sync: crate::sync_radio::SyncRadio,
@@ -34,12 +37,12 @@ pub struct Session {
 
 impl Session {
     pub fn boot(root: PathBuf) -> Self {
-        let mut sink: Box<dyn AudioSink> = open_sink();
-        if let Err(e) = sink.open(GBA_HZ) {
-            eprintln!("slot: audio: {e}");
-        }
-        let root_for_sync = root.clone();
-        Session {
+        Self::boot_with(root, opened_sink())
+    }
+
+    pub fn boot_with(root: PathBuf, sink: Box<dyn AudioSink>) -> Self {
+        let sync = crate::sync_radio::SyncRadio::new(&root);
+        let mut session = Session {
             app: App::boot(&root),
             root,
             emu: None,
@@ -50,10 +53,18 @@ impl Session {
             fast: false,
             motor: 0,
             pulse: None,
+            prefetch: Prefetch::default(),
             reloading: false,
             driven: false,
-            sync: crate::sync_radio::SyncRadio::new(&root_for_sync),
+            sync,
+        };
+        // A game left running comes straight back. Its core loads on its own thread, so start it
+        // now and let the card read overlap the rest of the boot. Waiting for the first update
+        // left a cold boot (after a power off) idle on the slot for the whole load.
+        if session.inserting() {
+            session.sync_core();
         }
+        session
     }
 
     pub fn play_sfx(&mut self, sfx: Sfx) {
@@ -81,6 +92,10 @@ impl Session {
         }
         self.motor = strength;
         self.app.set_rumble(strength);
+    }
+
+    pub fn prefetching(&self) -> Option<&std::path::Path> {
+        self.prefetch.reading()
     }
 
     pub fn core_rumble(&self) -> Option<&Rumble> {
@@ -149,14 +164,22 @@ impl Session {
 
     pub fn feed(&mut self, events: impl IntoIterator<Item = RawEvent>, now: Millis) {
         let mut actions = Vec::new();
+        let latched = self.gestures.ff_latched();
         for ev in events {
             actions.extend(self.gestures.feed(ev, now));
         }
         actions.extend(self.gestures.tick(now));
+        if !latched && self.app.in_game_menu().is_some() {
+            actions.extend(self.gestures.drop_ff_latch());
+        }
         for action in actions {
             self.act(action);
         }
         self.sync_pad();
+    }
+
+    pub fn set_menu_dpad_display(&mut self, enabled: bool) {
+        self.gestures.set_menu_dpad_display(enabled);
     }
 
     fn sync_pad(&mut self) {
@@ -182,10 +205,11 @@ impl Session {
         if trace() {
             eprintln!("slot: {action:?} in {:?}", self.app.phase());
         }
+        let menu_open = self.app.in_game_menu().is_some();
         match action {
-            Action::RewindStart => self.rewinding = true,
+            Action::RewindStart if !menu_open => self.rewinding = true,
             Action::RewindStop => self.rewinding = false,
-            Action::FfStart => self.fast = true,
+            Action::FfStart if !menu_open => self.fast = true,
             Action::FfStop => self.fast = false,
             _ => {}
         }
@@ -225,16 +249,26 @@ impl Session {
                 None => eprintln!("slot: link: a transport arrived with no core to run it"),
             }
         }
+        let mut recoloured = false;
         if let Some(p) = self.app.take_gb_palette() {
             if let Some(emu) = &self.emu {
                 emu.set_option("mgba_gb_colors", p.core_name());
+                recoloured = true;
             }
         }
         if let Some(on) = self.app.take_colour_correction() {
-            if let Some((key, value)) = crate::core::colour_option(self.app.core(), on) {
+            if let Some((key, value)) =
+                crate::core::colour_option(self.app.core(), self.app.playing_platform(), on)
+            {
                 if let Some(emu) = &self.emu {
                     emu.set_option(key, value);
+                    recoloured = true;
                 }
+            }
+        }
+        if recoloured && self.held() && !self.app.link_active() {
+            if let Some(emu) = &self.emu {
+                emu.refresh();
             }
         }
         if let Some((stem, serial)) = self.app.take_link_reload() {
@@ -260,13 +294,18 @@ impl Session {
                 self.act(action);
             }
         }
-        self.app
-            .set_game_ready(self.emu.as_ref().is_some_and(EmuHandle::has_published));
+        let ready = self.emu.as_ref().is_some_and(EmuHandle::has_published);
+        if ready && !self.app.game_ready() {
+            launch("first frame shown");
+        }
+        self.app.set_game_ready(ready);
         self.sync_speed();
         self.sync_rewind_hud();
         self.sync_ff_hud();
         self.sync_rumble();
         self.sync_pad();
+        let now = self.app.now();
+        self.prefetch.browse(self.app.browsed_rom(), now);
     }
 
     fn sync_save_sync(&mut self) {
@@ -289,12 +328,24 @@ impl Session {
             }
         };
         let now = self.app.now();
-        if asked > 0 {
-            self.pulse = Some((now, asked));
-        }
-        let want = match self.pulse {
-            Some((at, strength)) if now.saturating_sub(at) < RUMBLE_HOLD_MS => strength,
-            _ => 0,
+        let want = match (asked, self.pulse) {
+            (0, Some((at, strength))) if now.saturating_sub(at) < RUMBLE_MIN_MS => strength,
+            (0, _) => {
+                self.pulse = None;
+                0
+            }
+            (asked, Some((at, _))) => {
+                self.pulse = Some((at, asked));
+                if now.saturating_sub(at) < RUMBLE_MAX_MS {
+                    asked
+                } else {
+                    0
+                }
+            }
+            (asked, None) => {
+                self.pulse = Some((now, asked));
+                asked
+            }
         };
         self.rumble(want);
     }
@@ -344,7 +395,7 @@ impl Session {
     }
 
     fn held(&self) -> bool {
-        self.app.power_menu().is_some() || self.app.game_menu_open() || self.app.shutting_down()
+        self.app.game_menu_open() || self.app.in_game_menu().is_some() || self.app.shutting_down()
     }
 
     fn dozing(&self) -> bool {
@@ -359,6 +410,7 @@ impl Session {
         if let Some(emu) = &self.emu {
             emu.set_fast_steps(u32::from(self.app.ff_speed()));
             emu.set_ff_sound(self.app.ff_sound());
+            emu.set_runahead(self.app.runahead_in_play());
             emu.set_speed(
                 if self.inserting()
                     || self.ejecting()
@@ -426,6 +478,7 @@ impl Session {
             return;
         };
         let core = slot_store::core_for_platform(&self.root, stem, platform);
+        launch(&format!("opening {stem} on {}", core.as_str()));
         self.app.set_core(core);
         self.app.set_platform(platform);
         self.app
@@ -443,18 +496,22 @@ impl Session {
             &slot_store::stamp_now(),
         );
         let resume = start.resume;
+        launch("resume state read");
         let player = self.app.link_player();
         let palette = crate::core::palette_for(self.app.gb_palette(), platform, &rom, player);
         self.app.set_palette_live(palette.is_some());
         let opened = open_core(
             &self.root,
             core,
+            platform,
             serial,
-            self.app.colour_correction(),
+            self.app.colour_correction_for(platform),
             palette,
             player,
         );
         self.app.set_named_core(opened.named);
+        launch("core opened");
+        launch("save read");
         let ring = self.sink.ring();
         let emu = match player.filter(|_| platform == Platform::Gba) {
             Some(p) => EmuHandle::spawn_linked(opened.core, rom, ring, sav, resume, p),
@@ -501,4 +558,8 @@ impl Session {
 pub(crate) fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SLOT_TRACE").is_some())
+}
+
+fn launch(step: &str) {
+    eprintln!("slot: launch: {step} at {:.1} ms", crate::boot_time::ms());
 }

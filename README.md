@@ -42,27 +42,35 @@ Release notes can be found in the [changelog](CHANGELOG.md).
 
 # Supported Devices
 
-| Device | Supported | Since Version |
-| --- | --- | --- |
-| Anbernic RG SP | Yes | Always |
-| Anbernic RG34XX | Untested | N/A |
-| Anbernic RG34XXSP | Untested | N/A |
-| Anbernic RG35XXSP | Yes | 1.5.0 |
+| Device             | Supported                  | Since Version |
+|--------------------|----------------------------|---------------|
+| Anbernic RG SP     | Yes                        | Always        |
+| Anbernic RG34XX    | Yes                        | 1.4.0         |
+| Anbernic RG34XXSP  | Yes (No Stick Support Yet) | 1.4.0         |
+| Anbernic RG35XXSP  | Yes                        | 1.5.0         |
+| Anbernic 35XX Plus | Yes                        | 1.5.0         |
+| Anbernic RG28XX    | Yes                        | 1.6.0         |
+| Anbernic RG35XX-H  | Yes                        | 1.7.0         |
 
-The RG34XX will likely work from 1.4.0. The RG34XXSP may not map its sticks correctly.
-
-If you have one of the Untested devices, or have tried slot on a device not listed, please [open an issue on GitHub](https://github.com/BrandonKowalski/slot/issues) and let me know how it went.
+If you have one of the untested devices, or have tried slot on a device not listed,
+please [open an issue on GitHub](https://github.com/BrandonKowalski/slot/issues) and let me know how it went.
 
 ---
 
 # AI Disclosure
 
-The Rust frontend was put together by Claude Opus. I reviewed everything that was
-produced. All documentation is 100% free-range, meatbag prose.
+The Rust frontend, and the SVGs on [slot-cfw.fyi](https://slot-cfw.fyi), were put together by Claude.
+I reviewed everything that was produced. All documentation is 100% free-range, meatbag prose.
 
-The project is extremely low stakes. I wanted a bespoke frontend for my RG SP and thought
-that something that evokes the feeling of using my GBA SP as a kid would be pretty neat.
+My goal with this project was to recreate the feeling of playing my GBA SP in the back seat as a kid,
+but with a few modern creature comforts.
 
-Use it, don't use it, I don't care.
+Nothing about this project is exciting or groundbreaking from a technological perspective, and as a
+result, I delegated the glue code. mGBA and gpSP have been around forever and are the true stars of
+this show. The incredible skeuomorphic art is the work of [Markus](https://github.com/MarkusMaribu), an
+artist who saw the bare-bones version and offered to dress it up.
+
+I understand if my use of AI is a dealbreaker for you. Just know it's the least interesting part of
+what's here.
 
 Figured I should share the end result of all the wasted water. ✌🏻

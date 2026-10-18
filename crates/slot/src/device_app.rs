@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use slot::frontend::Frontend;
 use slot::input::DeviceInput;
+use slot::panel_turn::{panel_turn, PanelTurn};
 use slot_gfx::{Compositor, FbdevSurface, Surface};
 use slot_power::{trace_first_frame, DevicePlatform};
 
@@ -64,6 +65,13 @@ impl Pacer {
 }
 
 pub fn run() {
+    slot::boot_time::mark("start");
+    let _ = std::thread::Builder::new()
+        .name("slot-fonts".into())
+        .spawn(slot_ui::warm_fonts);
+    let audio = std::thread::Builder::new()
+        .name("slot-audio-open".into())
+        .spawn(slot::audio::opened_sink);
     let root = std::env::var_os("SLOT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(CARD));
@@ -74,6 +82,7 @@ pub fn run() {
             return;
         }
     };
+    slot::boot_time::mark("surface");
     let mut compositor = match Compositor::new(&surface) {
         Ok(c) => c,
         Err(e) => {
@@ -81,13 +90,49 @@ pub fn run() {
             return;
         }
     };
+    slot::boot_time::mark("compositor");
+    let panel = surface.window_size();
+    let env = |key| std::env::var(key).ok();
+    let turn = panel_turn(
+        panel,
+        slot::baseos::var("BASEOS_PANEL_ROTATION_CCW").as_deref(),
+        env("SLOT_ROTATE").as_deref(),
+    );
+    let turned = turn != PanelTurn::None;
+    let window = if turned { (panel.1, panel.0) } else { panel };
+    eprintln!(
+        "slot: baseos target {}, model {}, rotation ccw {}",
+        slot::baseos::var("BASEOS_TARGET").unwrap_or_default(),
+        slot::baseos::var("BASEOS_MODEL").unwrap_or_default(),
+        slot::baseos::var("BASEOS_PANEL_ROTATION_CCW").unwrap_or_default()
+    );
+    eprintln!(
+        "slot: panel {}x{}, canvas {}x{}, turn {turn:?}",
+        panel.0, panel.1, window.0, window.1
+    );
+    if turned {
+        if let Err(e) = compositor.set_panel_turn(panel, turn == PanelTurn::Ccw) {
+            eprintln!("slot: {e}");
+            return;
+        }
+    }
     let platform = DevicePlatform::new(root.clone());
     eprintln!("slot: {}", platform.report());
     platform.trace_boot();
-    let mut frontend = Frontend::boot(Box::new(platform));
-    frontend.upload_faces(&mut compositor);
-    frontend.upload_bezel(&mut compositor, surface.window_size());
+    slot::boot_time::mark("platform");
+    let sink = match audio.map(|h| h.join()) {
+        Ok(Ok(sink)) => sink,
+        _ => slot::audio::opened_sink(),
+    };
+    slot::boot_time::mark("audio");
+    let mut frontend = Frontend::boot_with(Box::new(platform), sink);
+    slot::boot_time::mark("frontend");
+    frontend.upload_boot_faces(&mut compositor);
+    slot::boot_time::mark("faces");
+    frontend.upload_bezel(&mut compositor, window);
+    slot::boot_time::mark("bezel");
     let mut input = DeviceInput::open(&root);
+    slot::boot_time::mark("input");
     let card = root.clone();
     let _ = std::thread::Builder::new()
         .name("slot-bootlogo".into())
@@ -108,7 +153,7 @@ pub fn run() {
             return;
         }
         frontend.step_emulator(pacer.period, STEP_TIMEOUT);
-        frontend.render(&mut compositor, surface.window_size());
+        frontend.render(&mut compositor, window);
         let swap = Instant::now();
         let work = swap - began;
         if let Err(e) = surface.swap() {
@@ -133,6 +178,7 @@ pub fn run() {
         }
         if !drawn {
             drawn = true;
+            slot::boot_time::mark("first frame");
             trace_first_frame();
         }
         if let Some(left) = MIN_FRAME.checked_sub(began.elapsed()) {

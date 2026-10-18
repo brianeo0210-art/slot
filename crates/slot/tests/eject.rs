@@ -264,7 +264,7 @@ fn the_eject_is_the_insert_run_backwards() {
 }
 
 #[test]
-fn the_veil_lifts_on_the_way_out_instead_of_falling_again() {
+fn the_veil_never_falls_again_on_the_way_out() {
     let d = tmp_root_with_carts(&["Emerald", "Fusion", "Metroid"]);
     let mut a = boot(d.path());
     let dt = 1.0 / 60.0;
@@ -297,7 +297,7 @@ fn the_veil_lifts_on_the_way_out_instead_of_falling_again() {
     }
     let later = veil(&a);
     assert!(
-        later < first,
+        later <= first,
         "the veil went from {first} to {later}: it is darkening on the way out"
     );
 }
@@ -337,4 +337,16 @@ fn the_core_stops_before_the_cart_moves() {
         published,
         "the core kept running while the picture was out"
     );
+}
+
+#[test]
+fn an_eject_the_card_refuses_puts_up_a_banner() {
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    let mut a = app_playing_in(d.path(), "Emerald");
+    let states = d.path().join("States");
+    let _ = std::fs::remove_dir_all(&states);
+    std::fs::write(&states, b"").unwrap();
+    a.apply(Action::Eject);
+    a.tick_ms(10);
+    assert!(a.card_alarm(), "a refused eject raised no alarm");
 }
