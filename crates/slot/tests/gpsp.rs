@@ -192,9 +192,21 @@ fn mgba_is_given_its_own_frameskip_and_none_of_gpsps() {
 
 #[test]
 fn both_cores_are_told_about_colour_correction_in_their_own_words() {
-    for (which, key, on, off) in [
-        (Core::Mgba, "mgba_color_correction", "Auto", "OFF"),
-        (Core::Gpsp, "gpsp_color_correction", "enabled", "disabled"),
+    for (which, key, on, off, theirs) in [
+        (
+            Core::Mgba,
+            "mgba_color_correction",
+            "Auto",
+            "OFF",
+            "gpsp_color_correction",
+        ),
+        (
+            Core::Gpsp,
+            "gpsp_color_correction",
+            "enabled",
+            "disabled",
+            "mgba_color_correction",
+        ),
     ] {
         let path = dylib_for(which);
         if !path.exists() {
@@ -220,10 +232,6 @@ fn both_cores_are_told_about_colour_correction_in_their_own_words() {
                 which.as_str()
             );
         }
-        let theirs = match which {
-            Core::Mgba => "gpsp_color_correction",
-            Core::Gpsp => "mgba_color_correction",
-        };
         assert_eq!(
             core.option(theirs),
             None,
@@ -437,10 +445,11 @@ fn a_gpsp_carts_resume_is_read_from_its_own_core_directory_through_the_session()
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    s.app_mut().tick_ms(60_000);
+    s.app_mut().tick_ms(300_000);
     s.app_mut().settle_saves();
 
     let state = persist::read_resume(d.path(), Platform::Gba, Core::Gpsp, "Emerald")
+        .unwrap()
         .expect("nothing resumed");
     let n = u64::from_le_bytes(state.try_into().expect("mock state is 8 bytes"));
     assert!(
@@ -487,10 +496,11 @@ fn a_gpsp_cart_runs_the_dylib_planted_under_its_own_name_through_the_session() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    s.app_mut().tick_ms(60_000);
+    s.app_mut().tick_ms(300_000);
     s.app_mut().settle_saves();
 
     let state = persist::read_resume(d.path(), Platform::Gba, Core::Gpsp, "Emerald")
+        .unwrap()
         .expect("nothing resumed");
     assert!(
         state.len() > 100_000,
@@ -527,7 +537,7 @@ fn changing_the_ini_mid_session_does_not_move_a_seated_carts_autosave() {
 
     std::fs::remove_file(d.path().join(SELECTED_CORE_FILE)).unwrap();
 
-    s.app_mut().tick_ms(60_000);
+    s.app_mut().tick_ms(300_000);
     s.app_mut().settle_saves();
 
     assert!(
@@ -623,6 +633,7 @@ fn changing_the_ini_mid_session_does_not_move_an_ejected_carts_resume() {
     std::fs::remove_file(d.path().join(SELECTED_CORE_FILE)).unwrap();
 
     s.app_mut().apply(Action::Eject);
+    s.app_mut().settle_saves();
 
     assert!(
         StateRing::new(d.path(), Platform::Gba, Core::Gpsp, "Emerald")
@@ -678,7 +689,7 @@ fn open_core_reaches_a_gpsp_named_dylib_under_the_content_roots_system_directory
 
 #[test]
 fn a_game_boy_carts_gpsp_line_is_dropped_and_it_runs_on_the_platform_default() {
-    let default = Core::default_for(Platform::Gb);
+    let default = Core::Gambatte;
     use slot::app::Phase;
     use slot::persist;
     use slot::session::Session;
@@ -709,6 +720,7 @@ fn a_game_boy_carts_gpsp_line_is_dropped_and_it_runs_on_the_platform_default() {
 
     let counter = |core| {
         persist::read_resume(d.path(), Platform::Gb, core, "Tetris")
+            .unwrap()
             .map(|b| u64::from_le_bytes(b.try_into().expect("the mock's state is 8 bytes")))
     };
 

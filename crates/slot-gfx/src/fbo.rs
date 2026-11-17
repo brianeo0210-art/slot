@@ -1,10 +1,10 @@
 use crate::draw::{Draw, Sprites, TexId};
-use crate::grade::blue_light_gain;
+use crate::grade::{blue_light_gain, contrast_boost, dim_gain, saturation_boost};
 use crate::pipeline::GamePass;
 use crate::quad::Quad;
-use crate::shaders::{BEZEL_FRAG, BLIT_FRAG, BLIT_VERT, TURN_VERT};
+use crate::shaders::{BLIT_FRAG, BLIT_VERT, TURN_VERT};
 use crate::surface::{blit_rect, GfxError, Surface, OUT_H, OUT_W};
-use crate::{Canvas, Layout};
+use crate::Canvas;
 
 pub const BACKDROP: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
@@ -22,30 +22,34 @@ pub struct Compositor {
     size: (u32, u32),
     blit: gl::types::GLuint,
     u_gain: gl::types::GLint,
+    u_saturation: gl::types::GLint,
+    u_contrast: gl::types::GLint,
     u_blit_uv: gl::types::GLint,
     gain: [f32; 3],
+    dim: f32,
+    saturation: f32,
+    contrast: f32,
     shake: f32,
     window: (u32, u32),
-    layout: Layout,
-    slide: f32,
     screen: f32,
     quad: Quad,
     game: GamePass,
     sprites: Sprites,
-    bezel_prog: gl::types::GLuint,
-    u_bezel_gain: gl::types::GLint,
-    u_bezel_alpha: gl::types::GLint,
-    bezel: Option<gl::types::GLuint>,
     game_bezel: Option<TexId>,
+    overlay: Option<crate::overlay::Overlay>,
+    overlay_pass: crate::overlay::OverlayPass,
+    overlay_full_drawn: bool,
+    placeholder: Option<[f32; 4]>,
     sp_frame: bool,
+    game_panel: bool,
     turn: Option<Turn>,
+    captured: Option<(u32, u32, Vec<u8>)>,
 }
 
 impl Compositor {
     pub fn new(surface: &dyn Surface) -> Result<Self, GfxError> {
         crate::gl::load(surface);
         let blit = crate::shaders::program(BLIT_VERT, BLIT_FRAG)?;
-        let bezel_prog = crate::shaders::program(BLIT_VERT, BEZEL_FRAG)?;
         let tex = crate::gl::texture(OUT_W, OUT_H, gl::NEAREST, gl::CLAMP_TO_EDGE, gl::RGBA, None);
         unsafe {
             let mut fbo = 0;
@@ -64,25 +68,15 @@ impl Compositor {
                 gl::DeleteFramebuffers(1, &fbo);
                 gl::DeleteTextures(1, &tex);
                 gl::DeleteProgram(blit);
-                gl::DeleteProgram(bezel_prog);
                 return Err(GfxError::Framebuffer(status));
             }
             gl::UseProgram(blit);
             gl::Uniform1i(crate::gl::uniform_location(blit, "u_tex"), 0);
             let u_gain = crate::gl::uniform_location(blit, "u_gain");
+            let u_saturation = crate::gl::uniform_location(blit, "u_saturation");
+            let u_contrast = crate::gl::uniform_location(blit, "u_contrast");
             let u_blit_uv = crate::gl::uniform_location(blit, "u_uv");
             gl::Uniform4f(u_blit_uv, 0.0, 0.0, 1.0, 1.0);
-            gl::UseProgram(bezel_prog);
-            gl::Uniform1i(crate::gl::uniform_location(bezel_prog, "u_tex"), 0);
-            let u_bezel_gain = crate::gl::uniform_location(bezel_prog, "u_gain");
-            let u_bezel_alpha = crate::gl::uniform_location(bezel_prog, "u_alpha");
-            gl::Uniform4f(
-                crate::gl::uniform_location(bezel_prog, "u_uv"),
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-            );
 
             Ok(Compositor {
                 fbo,
@@ -90,23 +84,28 @@ impl Compositor {
                 size: (OUT_W, OUT_H),
                 blit,
                 u_gain,
+                u_saturation,
+                u_contrast,
                 u_blit_uv,
                 gain: blue_light_gain(0),
+                dim: dim_gain(0),
+                saturation: saturation_boost(0),
+                contrast: contrast_boost(0),
                 shake: 0.0,
                 window: (OUT_W, OUT_H),
-                layout: Layout::Framed,
-                slide: 1.0,
                 screen: 0.0,
                 quad: Quad::new(),
                 game: GamePass::new()?,
                 sprites: Sprites::new()?,
-                bezel_prog,
-                u_bezel_gain,
-                u_bezel_alpha,
-                bezel: None,
                 game_bezel: None,
+                overlay: None,
+                overlay_pass: crate::overlay::OverlayPass::new()?,
+                overlay_full_drawn: false,
+                placeholder: None,
                 sp_frame: true,
+                game_panel: false,
                 turn: None,
+                captured: None,
             })
         }
     }
@@ -133,11 +132,11 @@ impl Compositor {
     }
 
     pub fn upload_game(&mut self, xrgb8888: &[u8]) {
-        self.game.upload(xrgb8888);
+        self.game.upload(xrgb8888, &self.quad);
     }
 
     pub fn draw_game(&mut self) {
-        self.game.draw(&self.quad);
+        self.in_game_rect(|c| c.game.draw(&c.quad));
     }
 
     pub fn draw_list(&mut self, items: &[Draw]) {
@@ -147,15 +146,30 @@ impl Compositor {
                 Draw::Game => {
                     self.sprites.draw(&items[from..i], &self.quad);
                     self.in_game_rect(|c| {
+                        c.draw_placeholder_bezel();
                         c.game.draw(&c.quad);
-                        c.draw_game_bezel();
+                        c.draw_overlay();
+                        if c.panel_bezel().is_none() {
+                            c.draw_game_bezel();
+                        }
                     });
+                    if let Some(bezel) = self.panel_bezel() {
+                        self.sprites.draw(&[bezel], &self.quad);
+                    }
                 }
                 Draw::Shot { tex } => {
                     self.sprites.draw(&items[from..i], &self.quad);
                     if let Some(tex) = self.sprites.source(tex) {
-                        self.in_game_rect(|c| c.game.draw_still(tex, &c.quad));
+                        self.in_game_rect(|c| {
+                            c.game.draw_still(tex, &c.quad);
+                            c.draw_overlay();
+                        });
                     }
+                }
+                Draw::Capture => {
+                    self.sprites.draw(&items[from..i], &self.quad);
+                    let (w, h) = self.size;
+                    self.captured = Some((w, h, self.read_frame()));
                 }
                 _ => continue,
             }
@@ -172,28 +186,114 @@ impl Compositor {
         self.sprites.create_texture_nearest(w, h, rgba)
     }
 
+    pub fn prepare_paper(&mut self) -> Result<(), GfxError> {
+        self.sprites.prepare_paper()
+    }
+
     pub fn update_texture(&mut self, id: TexId, w: u32, h: u32, rgba: &[u8]) {
         self.sprites.update_texture(id, w, h, rgba);
+    }
+
+    pub fn grade(&self) -> crate::grade::ColorGrade {
+        crate::grade::ColorGrade {
+            gain: self.gain.map(|g| g * self.dim),
+            saturation: self.saturation,
+            contrast: self.contrast,
+        }
     }
 
     pub fn set_blue_light(&mut self, step: u8) {
         self.gain = blue_light_gain(step);
     }
 
+    pub fn set_dim(&mut self, step: u8) {
+        self.dim = dim_gain(step);
+    }
+
+    pub fn set_saturation(&mut self, step: u8) {
+        self.saturation = saturation_boost(step);
+    }
+
+    pub fn set_contrast(&mut self, step: u8) {
+        self.contrast = contrast_boost(step);
+    }
+
     pub fn set_screen_effect(&mut self, effect: crate::ScreenEffect) {
         self.game.set_effect(effect);
+    }
+
+    pub fn set_frame_blend(&mut self, blend: crate::FrameBlend) {
+        self.game.set_blend(blend, &self.quad);
+    }
+
+    pub fn set_lcd(&mut self, lcd: crate::Lcd) {
+        self.game.set_lcd(lcd, &self.quad);
+    }
+
+    pub fn cut_frame_blend(&mut self) {
+        self.game.cut();
     }
 
     pub fn set_picture(&mut self, rect: [f32; 4]) {
         self.game.set_picture(rect);
     }
 
+    pub fn set_overlay(&mut self, overlay: Option<crate::overlay::Overlay>) {
+        self.overlay = overlay;
+    }
+
+    fn draw_overlay(&mut self) {
+        let Some(overlay) = self.overlay.filter(|_| self.screen >= 1.0) else {
+            return;
+        };
+        if let Some(tex) = overlay
+            .full
+            .filter(|_| !self.overlay_full_drawn)
+            .and_then(|(id, _, _)| self.sprites.source(id))
+        {
+            self.overlay_pass.draw_full(tex, self.size, &self.quad);
+            self.overlay_full_drawn = true;
+        }
+        if let Some((tex, w, h)) = overlay
+            .tile
+            .and_then(|(id, w, h)| Some((self.sprites.source(id)?, w, h)))
+        {
+            let [x, y, pw, ph] = self.game.picture_out();
+            let [sx, sy] = self.game.fbo_scale();
+            let [ox, oy] = self.game.origin();
+            let top = self.size.1 as f32 - oy - sy * OUT_H as f32;
+            let px = [ox + x * sx, top + y * sy, pw * sx, ph * sy];
+            self.overlay_pass
+                .draw_tile(tex, (w, h), px, self.size, &self.quad);
+        }
+    }
+
     pub fn set_game_bezel(&mut self, tex: Option<TexId>) {
         self.game_bezel = tex;
     }
 
+    pub fn set_placeholder_bezel(&mut self, colour: Option<[f32; 4]>) {
+        self.placeholder = colour;
+    }
+
     pub fn set_sp_frame(&mut self, on: bool) {
         self.sp_frame = on;
+    }
+
+    pub fn set_game_layout(&mut self, layout: crate::GameLayout) {
+        self.game_panel = layout.panel;
+        self.game.set_layout(layout.rect);
+    }
+
+    fn draw_placeholder_bezel(&mut self) {
+        let Some(colour) = self.placeholder else {
+            return;
+        };
+        let (x, y, w, h) = self.game.frame();
+        self.sprites.set_target(Canvas::FRAMED);
+        self.sprites
+            .draw(&[Draw::Rect { x, y, w, h, colour }], &self.quad);
+        self.sprites.set_target(Canvas::of(self.window));
     }
 
     fn draw_game_bezel(&mut self) {
@@ -213,8 +313,7 @@ impl Compositor {
             }],
             &self.quad,
         );
-        self.sprites
-            .set_target(Canvas::of(self.layout, self.window));
+        self.sprites.set_target(Canvas::of(self.window));
     }
 
     pub fn set_paper(&mut self, size: u32, gray: &[u8]) {
@@ -223,11 +322,11 @@ impl Compositor {
 
     pub fn fit(&mut self, window: (u32, u32)) {
         self.window = window;
-        self.resize(canvas_size(window));
+        self.resize(frame_size_for(window));
     }
 
     fn native(&self) -> bool {
-        self.layout == Layout::Native && crate::bezel::framed(self.window)
+        crate::layout::fills(self.window)
     }
 
     fn resize(&mut self, size: (u32, u32)) {
@@ -258,10 +357,6 @@ impl Compositor {
         self.size = size;
     }
 
-    pub fn set_overlay_slide(&mut self, t: f32) {
-        self.slide = t;
-    }
-
     pub fn set_screen_power(&mut self, t: f32) {
         self.screen = t;
         self.game.set_power(t);
@@ -281,6 +376,10 @@ impl Compositor {
 
     pub fn set_shake(&mut self, dx: f32) {
         self.shake = dx;
+    }
+
+    pub fn take_capture(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        self.captured.take()
     }
 
     pub fn frame_size(&self) -> (u32, u32) {
@@ -348,15 +447,10 @@ impl Compositor {
         buf.chunks_exact(stride).rev().flatten().copied().collect()
     }
 
-    pub fn begin_frame(&mut self, layout: Layout) {
-        self.layout = layout;
-        let size = if self.native() {
-            self.window
-        } else {
-            canvas_size(self.window)
-        };
-        self.resize(size);
-        self.sprites.set_target(Canvas::of(layout, self.window));
+    pub fn begin_frame(&mut self) {
+        self.overlay_full_drawn = false;
+        self.resize(frame_size_for(self.window));
+        self.sprites.set_target(Canvas::of(self.window));
         self.game.set_fbo_scale(
             self.size.0 as f32 / OUT_W as f32,
             self.size.1 as f32 / OUT_H as f32,
@@ -366,25 +460,6 @@ impl Compositor {
             gl::Viewport(0, 0, self.size.0 as i32, self.size.1 as i32);
             gl::ClearColor(BACKDROP[0], BACKDROP[1], BACKDROP[2], BACKDROP[3]);
             gl::Clear(gl::COLOR_BUFFER_BIT);
-        }
-    }
-
-    pub fn set_bezel(&mut self, w: u32, h: u32, rgba: &[u8]) {
-        let stride = w as usize * 4;
-        let mut bottom_up = Vec::with_capacity(rgba.len());
-        for row in rgba.chunks_exact(stride).rev() {
-            bottom_up.extend_from_slice(row);
-        }
-        let tex = crate::gl::texture(
-            w,
-            h,
-            gl::LINEAR,
-            gl::CLAMP_TO_EDGE,
-            gl::RGBA,
-            Some(&bottom_up),
-        );
-        if let Some(old) = self.bezel.replace(tex) {
-            unsafe { gl::DeleteTextures(1, &old) };
         }
     }
 
@@ -441,11 +516,14 @@ impl Compositor {
             gl::Clear(gl::COLOR_BUFFER_BIT);
             gl::UseProgram(self.blit);
             gl::ActiveTexture(gl::TEXTURE0);
-            gl::Uniform3f(self.u_gain, self.gain[0], self.gain[1], self.gain[2]);
+            let [r, g, b] = self.gain.map(|g| g * self.dim);
+            gl::Uniform3f(self.u_gain, r, g, b);
+            gl::Uniform1f(self.u_saturation, self.saturation);
+            gl::Uniform1f(self.u_contrast, self.contrast);
             gl::BindTexture(gl::TEXTURE_2D, self.tex);
         }
         if self.native() {
-            let canvas = Canvas::of(Layout::Native, window);
+            let canvas = Canvas::of(window);
             let dx = (self.shake * window.0 as f32 / canvas.w).round() as i32;
             self.blit_part(
                 dx,
@@ -456,47 +534,40 @@ impl Compositor {
             );
             return;
         }
-        let framed = crate::bezel::framed(window);
-        let (x, mut y, w, h) = blit_rect(window, self.shake);
-        if framed && !self.sp_frame {
-            y = (window.1 as i32 - h) / 2;
-        }
+        let (x, y, w, h) = blit_rect(window, self.shake);
         self.blit_part(x, y, w, h, [0.0, 0.0, 1.0, 1.0]);
-        let Some(bezel) = self
-            .bezel
-            .filter(|_| framed && self.sp_frame && self.slide > 0.0)
-        else {
-            return;
-        };
-        let drop = crate::bezel::lifted_rect(window, self.slide).1;
-        unsafe {
-            gl::Viewport(0, -drop, window.0 as i32, window.1 as i32);
-            gl::UseProgram(self.bezel_prog);
-            gl::Uniform3f(self.u_bezel_gain, self.gain[0], self.gain[1], self.gain[2]);
-            gl::Uniform1f(self.u_bezel_alpha, 1.0);
-            gl::BindTexture(gl::TEXTURE_2D, bezel);
-            gl::Enable(gl::BLEND);
-            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-        }
-        self.quad.draw();
-        unsafe { gl::Disable(gl::BLEND) };
+    }
+
+    fn panel_bezel(&self) -> Option<Draw> {
+        let tex = self
+            .game_bezel
+            .filter(|_| crate::bezel::framed(self.window))?;
+        let canvas = Canvas::of(self.window);
+        Some(Draw::Tex {
+            x: 0.0,
+            y: 0.0,
+            w: canvas.w,
+            h: canvas.h,
+            tex,
+            alpha: 1.0,
+        })
     }
 }
 
 impl Compositor {
     fn in_game_rect(&mut self, draw: impl FnOnce(&mut Self)) {
-        if !self.native() {
+        if !crate::bezel::framed(self.window) {
             return draw(self);
         }
-        let (w, h) = canvas_size(self.window);
+        let (x, top, w, h) = match self.game_panel {
+            true => (0, 0, self.size.0 as i32, self.size.1 as i32),
+            false => crate::bezel::game_rect(self.size, self.sp_frame),
+        };
         self.game
             .set_fbo_scale(w as f32 / OUT_W as f32, h as f32 / OUT_H as f32);
-        let y = match self.sp_frame {
-            true => self.size.1 - h,
-            false => (self.size.1 - h) / 2,
-        };
-        self.game.set_origin(0.0, y as f32);
-        unsafe { gl::Viewport(0, y as i32, w as i32, h as i32) };
+        let y = self.size.1 as i32 - top - h;
+        self.game.set_origin(x as f32, y as f32);
+        unsafe { gl::Viewport(x, y, w, h) };
         draw(self);
         self.game.set_origin(0.0, 0.0);
         self.game.set_fbo_scale(
@@ -515,6 +586,13 @@ impl Compositor {
     }
 }
 
+fn frame_size_for(window: (u32, u32)) -> (u32, u32) {
+    if !crate::layout::fills(window) {
+        return canvas_size(window);
+    }
+    crate::layout::panel_pixels(window)
+}
+
 pub fn canvas_size(window: (u32, u32)) -> (u32, u32) {
     let (_, _, w, h) = blit_rect(window, 0.0);
     let (w, h) = (w.max(1) as u32, h.max(1) as u32);
@@ -531,10 +609,6 @@ impl Drop for Compositor {
             gl::DeleteFramebuffers(1, &self.fbo);
             gl::DeleteTextures(1, &self.tex);
             gl::DeleteProgram(self.blit);
-            gl::DeleteProgram(self.bezel_prog);
-            if let Some(tex) = self.bezel {
-                gl::DeleteTextures(1, &tex);
-            }
             if let Some(turn) = &self.turn {
                 gl::DeleteProgram(turn.prog);
                 if turn.fbo != 0 {

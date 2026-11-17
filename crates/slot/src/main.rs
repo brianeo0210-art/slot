@@ -1,3 +1,10 @@
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 #[cfg(not(feature = "host"))]
 mod device_app;
 #[cfg(feature = "host")]
@@ -5,12 +12,28 @@ mod host_app;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--init-root") {
+    let first = args.next();
+    if first.as_deref() == Some("--install-bootlogo") {
+        let Some(card) = std::env::var_os("SLOT_ROOT") else {
+            eprintln!("slot: --install-bootlogo needs SLOT_ROOT");
+            std::process::exit(2);
+        };
+        let card = std::path::Path::new(&card);
+        slot::bootlogo::refresh(card);
+        slot::bootlogo::remember(card);
+        return;
+    }
+    if first.as_deref() == Some("--init-root") {
         let Some(dir) = args.next() else {
             eprintln!("slot: --init-root needs a directory");
             std::process::exit(2);
         };
         slot::root::ensure(std::path::Path::new(&dir));
+        return;
+    }
+    #[cfg(all(feature = "device", not(feature = "nds")))]
+    if let Some(mode) = std::env::var_os("SLOT_BLE_PROBE") {
+        slot::ble::probe(&mode.to_string_lossy());
         return;
     }
     slot::crash::install();

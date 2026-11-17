@@ -42,6 +42,13 @@ impl ButtonMask {
     }
 }
 
+pub fn mask_for(core_takes_xy: bool, mask: ButtonMask, frame: u32) -> ButtonMask {
+    match core_takes_xy {
+        true => mask,
+        false => mask.turbo(frame),
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct AvInfo {
     pub fps: f64,
@@ -78,11 +85,20 @@ impl From<std::io::Error> for CoreError {
 pub trait RetroCore: Send {
     fn load(&mut self, rom: &Path) -> Result<(), CoreError>;
     fn run_frame(&mut self, input: ButtonMask);
+    fn reset(&mut self) {}
     fn run_frame_linked(&mut self, p1: ButtonMask, _p2: ButtonMask) {
         self.run_frame(p1);
     }
     fn set_option(&mut self, _key: &str, _value: &str) {}
     fn set_frame_skip(&mut self, _skip: bool) {}
+    fn video_size(&self) -> (u32, u32) {
+        (GBA_W, GBA_H)
+    }
+    fn set_touch(&mut self, _at: Option<(u8, u8)>) {}
+    fn set_lid(&mut self, _shut: bool) {}
+    fn takes_xy(&self) -> bool {
+        false
+    }
     fn video_xrgb8888(&self) -> &[u8];
     fn take_audio(&mut self) -> Vec<i16>;
     fn serialize(&mut self) -> Result<Vec<u8>, CoreError>;

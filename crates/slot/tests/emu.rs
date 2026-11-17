@@ -195,7 +195,7 @@ fn fast_forward_runs_the_chosen_number_of_core_frames_per_present() {
         (FAST_STEPS_MAX, FAST_STEPS_MAX),
         (FAST_STEPS_MAX + 4, FAST_STEPS_MAX),
     ] {
-        emu.set_fast_steps(asked);
+        emu.set_fast_quarters(asked * 4);
         let (frames, presents) = held_counts(&emu);
         emu.set_speed(Speed::Fast);
         std::thread::sleep(Duration::from_millis(150));
@@ -287,10 +287,30 @@ fn spawn_probe(cost: Duration) -> (EmuHandle, Arc<Mutex<Vec<bool>>>) {
 }
 
 #[test]
+fn a_slow_speed_runs_its_fraction_of_a_frame_per_present() {
+    let emu = spawn();
+    std::thread::sleep(Duration::from_millis(300));
+    for quarters in [5u32, 6] {
+        emu.set_fast_quarters(quarters);
+        let (frames, presents) = held_counts(&emu);
+        emu.set_speed(Speed::Fast);
+        std::thread::sleep(Duration::from_millis(400));
+        let (frames_after, presents_after) = held_counts(&emu);
+        let (ran, shown) = (frames_after - frames, presents_after - presents);
+        assert!(shown > 8, "only {shown} presents at {quarters} quarters");
+        let want = shown * u64::from(quarters);
+        assert!(
+            (ran * 4).abs_diff(want) <= 8,
+            "{ran} frames over {shown} presents is not {quarters} quarters of a frame each"
+        );
+    }
+}
+
+#[test]
 fn every_speed_publishes_the_frame_the_core_last_ran() {
     let emu = spawn();
     for ceiling in [2, 3, 4, FAST_STEPS_MAX] {
-        emu.set_fast_steps(ceiling);
+        emu.set_fast_quarters(ceiling * 4);
         emu.set_speed(Speed::Fast);
         std::thread::sleep(Duration::from_millis(120));
         let (frames, _) = held_counts(&emu);
@@ -312,7 +332,7 @@ fn every_speed_publishes_the_frame_the_core_last_ran() {
 fn a_fast_present_draws_only_its_last_frame() {
     let ceiling = 3;
     let (emu, log) = spawn_probe(Duration::ZERO);
-    emu.set_fast_steps(ceiling);
+    emu.set_fast_quarters(ceiling * 4);
     emu.set_speed(Speed::Fast);
     std::thread::sleep(Duration::from_millis(60));
     log.lock().expect("the skip log").clear();
@@ -347,7 +367,7 @@ fn a_fast_present_draws_only_its_last_frame() {
 fn a_present_runs_what_it_can_afford_rather_than_the_whole_ceiling() {
     let cost = Duration::from_millis(8);
     let (emu, log) = spawn_probe(cost);
-    emu.set_fast_steps(FAST_STEPS_MAX);
+    emu.set_fast_quarters(FAST_STEPS_MAX * 4);
     held_counts(&emu);
     log.lock().expect("the skip log").clear();
     emu.set_speed(Speed::Fast);
@@ -438,7 +458,7 @@ fn fast_forward_sound_plays_sped_up_in_real_time() {
     emu.set_ff_sound(true);
     let real_time = 32_768.0 / 60.0;
     for steps in [2, 4] {
-        emu.set_fast_steps(steps);
+        emu.set_fast_quarters(steps * 4);
         emu.set_speed(Speed::Fast);
         std::thread::sleep(Duration::from_millis(50));
         assert!(!sink.muted(), "fast forward muted with its sound on");
@@ -1115,4 +1135,45 @@ fn a_refresh_redraws_a_paused_core_without_moving_it() {
         "the refresh never published a frame"
     );
     assert_eq!(frame_count(&emu), held, "the refresh moved the game on");
+}
+
+#[test]
+fn a_core_stuck_in_a_frame_does_not_hold_the_caller_past_two_seconds() {
+    let (emu, _) = spawn_probe(Duration::from_secs(4));
+    emu.set_speed(Speed::Normal);
+    std::thread::sleep(Duration::from_millis(200));
+    let snapshot = emu.snapshot();
+    let asked = Instant::now();
+    let state = snapshot.state();
+    let waited = asked.elapsed();
+    assert!(
+        state.is_none(),
+        "a state came back from a core that was stuck"
+    );
+    assert!(
+        waited < Duration::from_secs(3),
+        "the caller waited {waited:?} on a stuck core"
+    );
+}
+
+#[test]
+fn state_loads_resets_and_refreshes_each_cut_the_picture_and_frames_carry_their_cut() {
+    let emu = spawn();
+    let frame_after = |cut: u64| wait_for(|| emu.latest_frame().is_some_and(|f| f.cut() == cut));
+    assert!(frame_after(0), "no frame before any cut");
+    let state = emu
+        .request_state()
+        .recv_timeout(Duration::from_secs(2))
+        .expect("no state");
+    assert_eq!(emu.cuts(), 0, "saving a state jumped the picture");
+    emu.request_load(state);
+    assert!(frame_after(1), "no frame came tagged after the state load");
+    emu.snapshot().reset();
+    assert!(frame_after(2), "no frame came tagged after the reset");
+    emu.set_speed(Speed::Paused);
+    emu.refresh();
+    assert!(
+        frame_after(3),
+        "the refreshed frame was not tagged as a new picture"
+    );
 }

@@ -1,4 +1,4 @@
-use crate::draw::{Canvas, Draw, TexId};
+use crate::draw::{Draw, TexId};
 use crate::text;
 
 pub const HINT_H: u32 = 24;
@@ -135,23 +135,6 @@ pub fn hint_quad(x: f32, y: f32, w: f32, face: Option<TexId>) -> Draw {
             colour: [1.0, 1.0, 1.0, 0.12],
         },
     }
-}
-
-pub const LEGEND_GAP: f32 = 36.0;
-
-pub fn centred_hints(canvas: Canvas, hints: &[(TexId, u32)], gap: f32) -> Vec<(TexId, u32, f32)> {
-    let seen = |w: u32| w.saturating_sub(HINT_EDGE) as f32;
-    let total = hints.iter().map(|&(_, w)| seen(w)).sum::<f32>()
-        + gap * hints.len().saturating_sub(1) as f32;
-    let mut x = canvas.centred(total).round();
-    hints
-        .iter()
-        .map(|&(tex, w)| {
-            let at = x.round();
-            x += seen(w) + gap;
-            (tex, w, at)
-        })
-        .collect()
 }
 
 fn band_width(label: &str) -> u32 {
@@ -294,4 +277,41 @@ fn glyph_cap(glyph: char) -> Vec<u8> {
         }
     }
     cap
+}
+
+const PAD_GLYPH: char = '\u{f047}';
+const TICK_GLYPH: char = '\u{f00c}';
+
+pub fn pad_hint_width(label: &str) -> u32 {
+    CAP + CAP_GAP + band_width(label) + EDGE
+}
+
+pub fn pad_hint_face(label: &str) -> UndoFace {
+    let w = pad_hint_width(label);
+    let mut rgba = vec![0u8; (w * HINT_H * 4) as usize];
+    blit(
+        &mut rgba,
+        w,
+        &glyph_cap(PAD_GLYPH),
+        CAP,
+        CAP,
+        0,
+        (HINT_H - CAP) / 2,
+    );
+    let text_w = band_width(label);
+    let mut band = vec![0u8; (text_w * HINT_H * 4) as usize];
+    if let Some(font) = text::label_font() {
+        let layout = text::fit(font, label, text_w as f32, 1, LABEL_PX, LABEL_MIN_PX);
+        text::draw_centred(&mut band, text_w, HINT_H, &layout, INK);
+    }
+    blit(&mut rgba, w, &band, text_w, HINT_H, CAP + CAP_GAP, 0);
+    UndoFace { rgba, w, h: HINT_H }
+}
+
+pub fn tick_cap_face() -> UndoFace {
+    UndoFace {
+        rgba: glyph_cap(TICK_GLYPH),
+        w: CAP,
+        h: CAP,
+    }
 }

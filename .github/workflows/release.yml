@@ -9,8 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  checked:
+    name: tag made by task tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Refuse a tag whose commit did not pass task tag
+        if: github.ref_type == 'tag'
+        run: |
+          set -eu
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          if ! git cat-file tag "refs/tags/${GITHUB_REF_NAME}" | grep -qx "Checked: ${GITHUB_SHA}"; then
+            echo "::error::${GITHUB_REF_NAME} was not made by task tag, so its checks never ran on ${GITHUB_SHA}"
+            exit 1
+          fi
+
   build:
     name: card tree
+    needs: checked
     runs-on: ubuntu-24.04-arm
     container: rust:1-bullseye
     outputs:
@@ -18,13 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install zip, cmake and Task
+      - name: Install zip, cmake, Task and Bun
         run: |
           set -eu
           sed -i '/bullseye-security/d' /etc/apt/sources.list
           apt-get -o Acquire::Check-Valid-Until=false update
-          apt-get install -y --no-install-recommends zip cmake
+          apt-get install -y --no-install-recommends zip unzip cmake
           curl -fsSL https://taskfile.dev/install.sh | sh -s -- -b /usr/local/bin
+          curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s "bun-v1.2.6"
 
       - name: Fetch Syncthing for the card
         env:
@@ -56,6 +74,7 @@ jobs:
           file "$out/System/slot" | grep -q aarch64
           file "$out/System/mgba_libretro.so" | grep -q aarch64
           file "$out/System/gpsp_libretro.so" | grep -q aarch64
+          file "$out/System/gambatte_libretro.so" | grep -q aarch64
           file "$out/System/syncthing" | grep -q aarch64
           test -f "$out/System/licenses/syncthing-LICENSE.txt"
           test -x "$out/System/slot"
@@ -64,6 +83,12 @@ jobs:
           test -f "$out/System/licenses/gpsp-${gpsp_src_sha}.meta"
           for p in cores/gpsp/*.patch; do
             test -f "$out/System/licenses/gpsp-$(basename "$p")"
+          done
+          gambatte_src_sha="$(cat vendor/gambatte-src.sha)"
+          test -f "$out/System/licenses/gambatte-${gambatte_src_sha}.tar.gz"
+          test -f "$out/System/licenses/gambatte-${gambatte_src_sha}.meta"
+          for p in cores/gambatte/*.patch; do
+            test -f "$out/System/licenses/gambatte-$(basename "$p")"
           done
           mgba_src_commit="$(grep '^commit=' vendor/mgba_libretro.so.meta | cut -d= -f2)"
           test -f "$out/System/licenses/mgba-${mgba_src_commit}.meta"
@@ -93,7 +118,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.zip }}
@@ -104,10 +135,16 @@ jobs:
           ZIP: ${{ needs.build.outputs.zip }}
         run: |
           set -eu
-          cat > notes.md <<NOTES
-          Unzip and copy the contents of \`slot-${GITHUB_REF_NAME}/\` onto SD2.
-
-          Emulation by mGBA (MPL-2.0) and gpSP (GPL-2.0). Their licences, patches and gpSP's source are in \`System/licenses/\`.
-          NOTES
+          awk -v head="## [${GITHUB_REF_NAME#v}]" '
+            index($0, head) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          test -s notes.md
           gh release create "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" --notes-file notes.md
+
+      - name: Publish versions.json with the site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main

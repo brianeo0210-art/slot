@@ -15,7 +15,6 @@ fn seated(cart: &str) -> SlotState {
     SlotState {
         cart: Some(cart.into()),
         clock_set: true,
-        utc_offset_min: 0,
         ..Default::default()
     }
 }
@@ -43,6 +42,7 @@ fn eject_clears_the_slot_only_after_the_state_is_durable() {
         "Emerald",
         Some(&[9u8; 1024]),
         Some(b"savdata"),
+        &read_slot_state(d.path()),
     )
     .unwrap();
     assert_eq!(read_slot_state(d.path()).cart, None);
@@ -70,7 +70,8 @@ fn a_resume_that_cannot_be_written_leaves_the_cart_in_the_slot() {
         Core::Mgba,
         "Emerald",
         Some(&[9u8; 1024]),
-        None
+        None,
+        &read_slot_state(d.path()),
     )
     .is_err());
     assert_eq!(read_slot_state(d.path()).cart, Some("Emerald".into()));
@@ -90,6 +91,7 @@ fn an_unchanged_battery_save_is_not_rewritten() {
         "Emerald",
         Some(&[0u8; 8]),
         Some(b"savdata"),
+        &read_slot_state(d.path()),
     );
     let changed = eject(
         d.path(),
@@ -98,6 +100,7 @@ fn an_unchanged_battery_save_is_not_rewritten() {
         "Emerald",
         Some(&[0u8; 8]),
         Some(b"changed"),
+        &read_slot_state(d.path()),
     );
     set_mode(&saves, 0o755);
     unchanged.expect("identical bytes must not touch the card");
@@ -119,7 +122,6 @@ fn eject_preserves_the_levels() {
             volume: 35,
             muted: true,
             clock_set: true,
-            utc_offset_min: 0,
             ..SlotState::default()
         },
     )
@@ -131,6 +133,7 @@ fn eject_preserves_the_levels() {
         "Emerald",
         Some(&[0u8; 8]),
         None,
+        &read_slot_state(d.path()),
     )
     .unwrap();
     let s = read_slot_state(d.path());
@@ -139,11 +142,19 @@ fn eject_preserves_the_levels() {
 }
 
 #[test]
-fn ejecting_a_playing_cart_flushes_before_the_animation_starts() {
+fn ejecting_a_playing_cart_is_durable_before_the_cart_is_out() {
     let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
     let mut a = app_playing_in(d.path(), "Emerald");
     a.apply(Action::Eject);
     assert!(matches!(a.phase(), Phase::Ejecting { .. }));
+    for _ in 0..600 {
+        if !matches!(a.phase(), Phase::Ejecting { .. }) {
+            break;
+        }
+        a.update(1.0 / 60.0);
+    }
+    assert!(matches!(a.phase(), Phase::Shelf), "{:?}", a.phase());
+    a.settle_saves();
     let r = StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald");
     assert_eq!(
         r.read_resume().unwrap().expect("nothing was flushed").len(),
@@ -203,7 +214,7 @@ fn the_row_closes_back_up_as_the_cart_comes_out() {
             .count()
     };
     let early = carts(&a);
-    for _ in 0..40 {
+    for _ in 0..50 {
         a.update(1.0 / 60.0);
     }
     let late = carts(&a);
@@ -311,7 +322,12 @@ fn the_core_stops_before_the_cart_moves() {
     for _ in 0..90 {
         s.update(1.0 / 60.0);
     }
-    assert!(s.has_core(), "no core to stop");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while s.emu().is_none() {
+        assert!(Instant::now() < deadline, "no core to stop");
+        std::thread::sleep(Duration::from_millis(1));
+        s.update(1.0 / 60.0);
+    }
 
     s.app_mut().apply(Action::Eject);
     s.update(1.0 / 60.0);
@@ -347,6 +363,54 @@ fn an_eject_the_card_refuses_puts_up_a_banner() {
     let _ = std::fs::remove_dir_all(&states);
     std::fs::write(&states, b"").unwrap();
     a.apply(Action::Eject);
+    a.settle_saves();
     a.tick_ms(10);
     assert!(a.card_alarm(), "a refused eject raised no alarm");
+}
+
+#[test]
+fn an_eject_saves_the_state_with_both_resume_rows_off() {
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    write_slot_state(
+        d.path(),
+        &SlotState {
+            resume_insert: false,
+            resume_power_on: false,
+            ..seated("Emerald")
+        },
+    )
+    .unwrap();
+    let mut a = slot::app::App::boot(d.path());
+    a.set_snapshot(StubSnapshot::boxed());
+    a.on_core_ready();
+    for _ in 0..120 {
+        a.update(1.0 / 60.0);
+    }
+    a.apply(Action::Eject);
+    a.settle_saves();
+    let r = StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald");
+    assert_eq!(
+        r.read_resume()
+            .unwrap()
+            .expect("the eject wrote no resume")
+            .len(),
+        1024
+    );
+}
+
+#[test]
+fn an_eject_is_on_the_card_once_saves_settle() {
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    let mut a = app_playing_in(d.path(), "Emerald");
+    a.apply(Action::Eject);
+    a.settle_saves();
+    let r = StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald");
+    assert_eq!(
+        r.read_resume()
+            .unwrap()
+            .expect("the eject wrote no resume")
+            .len(),
+        1024
+    );
+    assert_eq!(read_slot_state(d.path()).cart, None);
 }

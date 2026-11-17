@@ -127,7 +127,6 @@ fn the_backlight_follows_brightness_from_boot() {
         &SlotState {
             brightness: 3,
             clock_set: true,
-            utc_offset_min: 0,
             ..Default::default()
         },
     )
@@ -135,9 +134,18 @@ fn the_backlight_follows_brightness_from_boot() {
     let mut a = boot(d.path());
     let (power, step) = panel(d.path(), Duration::from_secs(60));
     a.set_power(power);
-    assert_eq!(step.load(Ordering::Relaxed), 3);
-    a.apply(Action::BrightnessUp);
     assert_eq!(step.load(Ordering::Relaxed), 4);
+    a.apply(Action::BrightnessUp);
+    assert_eq!(step.load(Ordering::Relaxed), 5);
+    for _ in 0..12 {
+        a.apply(Action::BrightnessDown);
+    }
+    assert_eq!(a.brightness(), 0);
+    assert_eq!(
+        step.load(Ordering::Relaxed),
+        1,
+        "the lowest brightness turned the panel off"
+    );
 }
 
 #[test]
@@ -407,4 +415,29 @@ fn a_shut_lid_over_a_session_takes_its_network_down_too() {
         "the session's own network must come down before the driver does: {jobs:?}"
     );
     assert!(jobs.contains(&RadioJob::Cool));
+}
+
+#[test]
+fn a_shut_lid_powers_off_after_the_minutes_set_in_the_menu() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    write_slot_state(
+        d.path(),
+        &SlotState {
+            clock_set: true,
+            lid_off_min: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut a = boot(d.path());
+    a.set_power(panel(d.path(), Duration::from_secs(300)).0);
+    a.apply(Action::LidClose);
+    for _ in 0..59 * 60 {
+        a.update(1.0 / 60.0);
+    }
+    assert!(!a.powering_off(), "59 s is short of the minute");
+    for _ in 0..120 {
+        a.update(1.0 / 60.0);
+    }
+    assert!(a.powering_off());
 }

@@ -1,3 +1,4 @@
+use crate::ghost::{FrameBlend, Ghost, Lcd};
 use crate::lcd3x::ScreenEffect;
 use crate::power::{screen_brightness, screen_rect_above};
 use crate::quad::Quad;
@@ -10,9 +11,16 @@ pub const SRC_H: u32 = OUT_H / SCALE;
 
 pub const WHOLE_TEXTURE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
+const FULL: [f32; 4] = [0.0, 0.0, OUT_W as f32, OUT_H as f32];
+
 pub struct GamePass {
     prog: gl::types::GLuint,
-    game: gl::types::GLuint,
+    game: [gl::types::GLuint; 2],
+    at: usize,
+    held: usize,
+    blend: FrameBlend,
+    lcd: Lcd,
+    ghost: Ghost,
     u_rect: gl::types::GLint,
     u_bright: gl::types::GLint,
     u_uv: gl::types::GLint,
@@ -32,12 +40,15 @@ pub struct GamePass {
     /// Pixels kept for the carousel footer. The picture scales in the space above them.
     bottom: f32,
     src: [f32; 4],
+    layout: [f32; 4],
 }
 
 impl GamePass {
     pub fn new() -> Result<Self, GfxError> {
         let prog = crate::shaders::program(RECT_VERT, GAME_FRAG)?;
-        let game = crate::gl::texture(SRC_W, SRC_H, gl::NEAREST, gl::CLAMP_TO_EDGE, gl::BGRA, None);
+        let game = [0, 1].map(|_| {
+            crate::gl::texture(SRC_W, SRC_H, gl::NEAREST, gl::CLAMP_TO_EDGE, gl::BGRA, None)
+        });
         let paper = crate::gl::texture(
             1,
             1,
@@ -73,6 +84,11 @@ impl GamePass {
         Ok(GamePass {
             prog,
             game,
+            at: 0,
+            held: 0,
+            blend: FrameBlend::Off,
+            lcd: Lcd::Gba,
+            ghost: Ghost::new()?,
             u_rect,
             u_bright,
             u_uv,
@@ -91,6 +107,7 @@ impl GamePass {
             fills: false,
             bottom: 0.0,
             src: WHOLE_TEXTURE,
+            layout: FULL,
         })
     }
 
@@ -103,15 +120,15 @@ impl GamePass {
     }
 
     pub fn frame(&self) -> (f32, f32, f32, f32) {
-        self.placed()
-    }
-
-    fn placed(&self) -> (f32, f32, f32, f32) {
         let foot = self.bottom;
         match self.fills {
             true => (0.0, 0.0, OUT_W as f32, OUT_H as f32 - foot),
-            false => screen_rect_above(self.power, foot),
+            false => screen_rect_above(crate::Canvas::FRAMED, self.power, foot),
         }
+    }
+
+    pub fn set_layout(&mut self, rect: [f32; 4]) {
+        self.layout = rect;
     }
 
     pub fn set_fills_frame(&mut self, on: bool) {
@@ -120,6 +137,25 @@ impl GamePass {
 
     pub fn set_picture(&mut self, rect: [f32; 4]) {
         self.pic = rect;
+    }
+
+    pub fn fbo_scale(&self) -> [f32; 2] {
+        self.fbo_scale
+    }
+
+    pub fn origin(&self) -> [f32; 2] {
+        self.origin
+    }
+
+    pub fn picture_out(&self) -> [f32; 4] {
+        let (rx, ry, rw, rh) = placed_in(self.frame(), self.layout);
+        let [sx, sy, sw, sh] = self.src;
+        let [p0, q0, p1, q1] = self.pic;
+        let (u0, v0) = (p0.max(sx), q0.max(sy));
+        let (u1, v1) = (p1.min(sx + sw), q1.min(sy + sh));
+        let x = rx + (u0 - sx) / sw * rw;
+        let y = ry + (v0 - sy) / sh * rh;
+        [x, y, (u1 - u0) / sw * rw, (v1 - v0) / sh * rh]
     }
 
     pub fn set_fbo_scale(&mut self, x: f32, y: f32) {
@@ -132,6 +168,42 @@ impl GamePass {
 
     pub fn set_effect(&mut self, effect: ScreenEffect) {
         self.effect = effect;
+    }
+
+    pub fn set_blend(&mut self, blend: FrameBlend, quad: &Quad) {
+        if blend != self.blend {
+            self.blend = blend;
+            self.reblend(quad);
+        }
+    }
+
+    pub fn set_lcd(&mut self, lcd: Lcd, quad: &Quad) {
+        if lcd != self.lcd {
+            self.lcd = lcd;
+            self.reblend(quad);
+        }
+    }
+
+    pub fn cut(&mut self) {
+        self.held = 0;
+        self.ghost.reset();
+    }
+
+    fn reblend(&mut self, quad: &Quad) {
+        self.ghost.reset();
+        let (game, last) = (self.game[self.at], self.game[1 - self.at]);
+        match (self.blend, self.held) {
+            (_, 0) | (FrameBlend::Off, _) => {}
+            (_, 1) => self.ghost.respond(game, [0.0; 2], quad),
+            (FrameBlend::Mix, _) => {
+                self.ghost.respond(last, [0.0; 2], quad);
+                self.ghost.mix(game, last, quad);
+            }
+            (FrameBlend::Ghosting, _) => {
+                self.ghost.respond(last, [0.0; 2], quad);
+                self.ghost.respond(game, self.lcd.response(), quad);
+            }
+        }
     }
 
     pub fn set_paper(&mut self, size: u32, gray: &[u8]) {
@@ -152,12 +224,16 @@ impl GamePass {
         self.src = rect;
     }
 
-    pub fn upload(&mut self, xrgb8888: &[u8]) {
+    pub fn upload(&mut self, xrgb8888: &[u8], quad: &Quad) {
         if xrgb8888.len() < (SRC_W * SRC_H * 4) as usize {
             return;
         }
+        let last = self.game[self.at];
+        self.at = 1 - self.at;
+        let game = self.game[self.at];
+        self.held = (self.held + 1).min(2);
         unsafe {
-            gl::BindTexture(gl::TEXTURE_2D, self.game);
+            gl::BindTexture(gl::TEXTURE_2D, game);
             gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
             gl::TexSubImage2D(
                 gl::TEXTURE_2D,
@@ -171,22 +247,34 @@ impl GamePass {
                 xrgb8888.as_ptr() as *const std::ffi::c_void,
             );
         }
+        match self.blend {
+            FrameBlend::Off => {}
+            FrameBlend::Mix => self.ghost.mix(game, last, quad),
+            FrameBlend::Ghosting => self.ghost.respond(game, self.lcd.response(), quad),
+        }
     }
 
     pub fn draw(&self, quad: &Quad) {
         let src = match self.effect {
-            ScreenEffect::Grid => whole_scale_source(self.src, self.fbo_scale),
+            ScreenEffect::Grid if self.layout == FULL => {
+                whole_scale_source(self.src, self.fbo_scale)
+            }
             _ => self.src,
         };
-        self.draw_source(self.game, quad, src);
+        let game = self.game[self.at];
+        let shown = match self.blend {
+            FrameBlend::Off => game,
+            FrameBlend::Mix | FrameBlend::Ghosting => self.ghost.texture().unwrap_or(game),
+        };
+        self.draw_source(shown, quad, src, self.layout);
     }
 
     pub fn draw_still(&self, tex: gl::types::GLuint, quad: &Quad) {
-        self.draw_source(tex, quad, WHOLE_TEXTURE);
+        self.draw_source(tex, quad, self.src, self.layout);
     }
 
-    fn draw_source(&self, tex: gl::types::GLuint, quad: &Quad, src: [f32; 4]) {
-        let (x, y, w, h) = self.placed();
+    fn draw_source(&self, tex: gl::types::GLuint, quad: &Quad, src: [f32; 4], layout: [f32; 4]) {
+        let (x, y, w, h) = placed_in(self.frame(), layout);
         let bright = if self.fills {
             1.0
         } else {
@@ -223,6 +311,13 @@ impl GamePass {
     }
 }
 
+fn placed_in(frame: (f32, f32, f32, f32), layout: [f32; 4]) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = frame;
+    let [lx, ly, lw, lh] = layout;
+    let (sx, sy) = (lw / OUT_W as f32, lh / OUT_H as f32);
+    (lx + x * sx, ly + y * sy, w * sx, h * sy)
+}
+
 fn whole_scale_source(src: [f32; 4], fbo: [f32; 2]) -> [f32; 4] {
     let (x, w) = whole_scale(src[0], src[2], SRC_W as f32, OUT_W as f32 * fbo[0]);
     let (y, h) = whole_scale(src[1], src[3], SRC_H as f32, OUT_H as f32 * fbo[1]);
@@ -243,7 +338,7 @@ fn whole_scale(at: f32, len: f32, texels: f32, out: f32) -> (f32, f32) {
 impl Drop for GamePass {
     fn drop(&mut self) {
         unsafe {
-            gl::DeleteTextures(1, &self.game);
+            gl::DeleteTextures(2, self.game.as_ptr());
             gl::DeleteTextures(1, &self.paper);
             gl::DeleteProgram(self.prog);
         }

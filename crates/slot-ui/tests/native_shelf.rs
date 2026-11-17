@@ -14,6 +14,7 @@ fn carts(stems: &[&str]) -> Vec<Cart> {
             code: String::new(),
             shell: None,
             title: stem.to_uppercase(),
+            tags: Vec::new(),
         })
         .collect()
 }
@@ -54,7 +55,19 @@ fn the_framed_canvas_draws_the_slot_strip_whole_as_today() {
 fn a_native_wallpaper_is_the_centre_of_the_framed_one() {
     let mut out = Vec::new();
     let ground = TexId::from_raw(3);
-    slot_ui::draw_ground(NATIVE, Some(ground), &mut out);
+    slot_ui::draw_ground(NATIVE, Some((ground, 720)), &mut out);
     assert!(out.iter().any(|d| matches!(*d,
         Draw::Part { w, tex, uv, .. } if tex == ground && w == 640.0 && uv == NATIVE.window(720.0))));
+}
+
+#[test]
+fn a_panel_sized_wallpaper_is_cropped_top_and_bottom_in_the_frame() {
+    let mut out = Vec::new();
+    let ground = TexId::from_raw(3);
+    slot_ui::draw_ground(Canvas::FRAMED, Some((ground, 640)), &mut out);
+    let shown = 640.0 / 720.0;
+    assert!(out.iter().any(|d| matches!(*d,
+        Draw::Part { w, h, tex, uv, .. }
+            if tex == ground && w == 720.0 && h == 480.0
+                && uv == [0.0, (1.0 - shown) / 2.0, 1.0, shown])));
 }

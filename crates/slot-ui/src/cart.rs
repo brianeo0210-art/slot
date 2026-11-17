@@ -1,4 +1,5 @@
 use slot_store::gb::Class;
+pub use slot_store::{clean_label, label_tags};
 use slot_store::{Cart, Outline, Platform};
 
 use crate::art;
@@ -33,19 +34,10 @@ pub const LABEL_Y: u32 = label_panel(CART_W, CART_H).1;
 pub const LABEL_W: u32 = label_panel(CART_W, CART_H).2 - LABEL_X;
 pub const LABEL_H: u32 = label_panel(CART_W, CART_H).3 - LABEL_Y;
 
-pub const fn gb_label_panel(w: u32, h: u32) -> (u32, u32, u32, u32) {
-    (
-        (w * 147 + 500) / 1000,
-        (h * 291 + 500) / 1000,
-        (w * 854 + 500) / 1000,
-        (h * 868 + 500) / 1000,
-    )
-}
-
-pub const GB_LABEL_X: u32 = gb_label_panel(GB_CART_W, GB_CART_H).0;
-pub const GB_LABEL_Y: u32 = gb_label_panel(GB_CART_W, GB_CART_H).1;
-pub const GB_LABEL_W: u32 = gb_label_panel(GB_CART_W, GB_CART_H).2 - GB_LABEL_X;
-pub const GB_LABEL_H: u32 = gb_label_panel(GB_CART_W, GB_CART_H).3 - GB_LABEL_Y;
+pub const GB_LABEL_X: u32 = 44;
+pub const GB_LABEL_Y: u32 = 95;
+pub const GB_LABEL_W: u32 = 223;
+pub const GB_LABEL_H: u32 = 199;
 
 /// The Game Boy Color pak's label box: exactly the flat label well drawn in
 /// `assets/gbc_neutral.png`, x 45..267, y 110..308 of 312x337. It is the same 223x199
@@ -77,11 +69,67 @@ struct Spec {
 enum Shape {
     Gba,
     Gb(GbShell),
+    #[cfg(feature = "nds")]
+    Ds,
+}
+
+#[cfg(feature = "nds")]
+pub const DS_LABEL_X: u32 = 15;
+#[cfg(feature = "nds")]
+pub const DS_LABEL_Y: u32 = 23;
+#[cfg(feature = "nds")]
+pub const DS_LABEL_W: u32 = 170;
+#[cfg(feature = "nds")]
+pub const DS_LABEL_H: u32 = 184;
+#[cfg(feature = "nds")]
+const DS_LABEL: (u32, u32, u32, u32) = (DS_LABEL_X, DS_LABEL_Y, DS_LABEL_W, DS_LABEL_H);
+
+pub fn folder_gb_shell(cart: &Cart) -> Option<GbShell> {
+    match cart.platform {
+        Platform::Gba | Platform::Gbav => None,
+        #[cfg(feature = "nds")]
+        Platform::Nds => None,
+        Platform::Gb | Platform::Gbc => Some(match cart.shell.map(|c| c.outline) {
+            Some(Outline::Notched) => GbShell::Notched,
+            Some(Outline::Rounded) => GbShell::Rounded,
+            _ if cart.platform == Platform::Gbc => GbShell::Rounded,
+            _ => GbShell::Notched,
+        }),
+    }
+}
+
+pub fn folder_is_clear(cart: &Cart) -> bool {
+    cart.shell
+        .is_some_and(|c| c.finish != slot_store::ShellFinish::Solid)
+}
+
+pub fn shelf_shape(cart: &Cart) -> (Option<GbShell>, bool) {
+    let clear = |shell: Option<Shell>| match shell {
+        Some(s) => s.finish != Finish::Solid,
+        None => folder_is_clear(cart),
+    };
+    let shell = crate::shell::indexed_shell(cart);
+    let outline = cart.shell.map(|c| c.outline);
+    let shape = match (cart.platform, outline) {
+        (Platform::Gba | Platform::Gbav, _) => None,
+        #[cfg(feature = "nds")]
+        (Platform::Nds, _) => None,
+        (_, Some(Outline::Notched)) => Some(GbShell::Notched),
+        (_, Some(Outline::Rounded)) => Some(GbShell::Rounded),
+        _ => match slot_store::header_index::peek_gb_header(&cart.rom).flatten() {
+            Some(h) if h.class() == Class::ColourOnly => Some(GbShell::Rounded),
+            Some(_) => Some(GbShell::Notched),
+            None => folder_gb_shell(cart),
+        },
+    };
+    (shape, clear(shell))
 }
 
 pub fn gb_shell_of(cart: &Cart) -> Option<GbShell> {
     match cart.platform {
-        Platform::Gba => None,
+        Platform::Gba | Platform::Gbav => None,
+        #[cfg(feature = "nds")]
+        Platform::Nds => None,
         Platform::Gb | Platform::Gbc => Some(match cart.shell.map(|c| c.outline) {
             Some(Outline::Notched) => GbShell::Notched,
             Some(Outline::Rounded) => GbShell::Rounded,
@@ -108,6 +156,10 @@ pub fn label_rect(shell: Option<GbShell>) -> (f32, f32, f32, f32) {
 }
 
 fn shape_of(cart: &Cart) -> Shape {
+    #[cfg(feature = "nds")]
+    if cart.platform == Platform::Nds {
+        return Shape::Ds;
+    }
     match gb_shell_of(cart) {
         None => Shape::Gba,
         Some(shell) => Shape::Gb(shell),
@@ -141,6 +193,15 @@ fn spec(shape: Shape) -> Spec {
                 GbShell::Rounded => bitmaps::gbc_cart(),
             },
         },
+        #[cfg(feature = "nds")]
+        Shape::Ds => Spec {
+            w: bitmaps::DS_CART_W,
+            h: bitmaps::DS_CART_H,
+            label: DS_LABEL,
+            mask: bitmaps::ds_cart_mask(),
+            mould: Mould::Ds,
+            paint: bitmaps::ds_cart(),
+        },
     }
 }
 
@@ -150,14 +211,21 @@ const GB_SEATED_H: u32 = 259;
 
 pub fn seated_box(platform: Platform) -> (u32, u32) {
     match platform {
-        Platform::Gba => (SEATED_W, SEATED_H),
+        Platform::Gba | Platform::Gbav => (SEATED_W, SEATED_H),
+        #[cfg(feature = "nds")]
+        Platform::Nds => (
+            (SEATED_H * bitmaps::DS_CART_W + bitmaps::DS_CART_H / 2) / bitmaps::DS_CART_H,
+            SEATED_H,
+        ),
         Platform::Gb | Platform::Gbc => (SEATED_W, GB_SEATED_H),
     }
 }
 
 pub fn cart_box(platform: Platform) -> (u32, u32) {
     let s = spec(match platform {
-        Platform::Gba => Shape::Gba,
+        Platform::Gba | Platform::Gbav => Shape::Gba,
+        #[cfg(feature = "nds")]
+        Platform::Nds => Shape::Ds,
         Platform::Gb | Platform::Gbc => Shape::Gb(GbShell::Notched),
     });
     (s.w, s.h)
@@ -236,8 +304,12 @@ pub fn cart_backing(shell: Option<GbShell>) -> CartFace {
             h: BOARD_H,
         };
     };
+    gb_backing(bitmaps::gb_board(), shell)
+}
+
+pub fn gb_backing(board: &[u8], shell: GbShell) -> CartFace {
     let s = spec(Shape::Gb(shell));
-    let mut rgba = bitmaps::gb_board().to_vec();
+    let mut rgba = board.to_vec();
     for (px, cover) in rgba.chunks_exact_mut(4).zip(s.mask) {
         px[3] = ((px[3] as u32 * *cover as u32 + 127) / 255) as u8;
     }
@@ -253,12 +325,98 @@ pub fn label_size(cart: &Cart) -> (u32, u32) {
     (lw, lh)
 }
 
+pub fn bare_face(cart: &Cart) -> CartFace {
+    let s = spec(shape_of(cart));
+    let mut face = shell_face_of(&s, &shell_for(cart), true);
+    clip_to_silhouette(&s, &mut face);
+    face
+}
+
+pub fn text_label(cart: &Cart, colour: [u8; 3]) -> Vec<u8> {
+    generated_label(&spec(shape_of(cart)), &label_text(cart), colour)
+}
+
+fn hand_parts(s: &Spec, cart: &Cart) -> Option<(CartFace, crate::hand::Written)> {
+    let font = crate::hand::hand_font()?;
+    let face = shell_face_of(s, &shell_for(cart), true);
+    let (lx, ly, lw, lh) = s.label;
+    let c = (((ly + lh / 2) * s.w + lx + lw / 2) * 4) as usize;
+    let recess = [face.rgba[c], face.rgba[c + 1], face.rgba[c + 2]];
+    let written = font.write(&label_text(cart), &cart.tags, &cart.stem, lw, lh, recess);
+    Some((face, written))
+}
+
+fn ink_rgba(colour: [u8; 3], coverage: &[u8]) -> Vec<u8> {
+    coverage
+        .iter()
+        .flat_map(|a| [colour[0], colour[1], colour[2], *a])
+        .collect()
+}
+
+fn handwritten(s: &Spec, cart: &Cart) -> Option<CartFace> {
+    #[cfg(feature = "nds")]
+    if cart.platform == Platform::Nds {
+        return None;
+    }
+    let (mut face, written) = hand_parts(s, cart)?;
+    paste_ink(s, &mut face, written.colour, &written.ink);
+    clip_to_silhouette(s, &mut face);
+    Some(face)
+}
+
+pub fn writes_by_hand(cart: &Cart) -> bool {
+    #[cfg(feature = "nds")]
+    if cart.platform == Platform::Nds {
+        return false;
+    }
+    cart.label.is_none() && crate::hand::hand_font().is_some()
+}
+
+pub struct HandReveal {
+    pub blank: CartFace,
+    pub ink: [u8; 3],
+    pub frames: Vec<(Vec<u8>, [f32; 2])>,
+    pub w: u32,
+    pub h: u32,
+}
+
+pub fn hand_reveal(cart: &Cart, frames: u32) -> Option<HandReveal> {
+    let s = spec(shape_of(cart));
+    #[cfg(feature = "nds")]
+    if cart.platform == Platform::Nds {
+        return None;
+    }
+    let (mut blank, written) = hand_parts(&s, cart)?;
+    clip_to_silhouette(&s, &mut blank);
+    let frames = crate::hand::reveal(&written, frames)
+        .into_iter()
+        .map(|(cov, pen)| (ink_rgba(written.colour, &cov), pen))
+        .collect();
+    Some(HandReveal {
+        blank,
+        ink: written.colour,
+        frames,
+        w: written.w,
+        h: written.h,
+    })
+}
+
 pub fn cart_face_with(cart: &Cart, art: Option<Vec<u8>>) -> CartFace {
     let s = spec(shape_of(cart));
+    if art.is_none() {
+        if let Some(face) = handwritten(&s, cart) {
+            return face;
+        }
+    }
     let mut face = shell_face(&s, &shell_for(cart));
     let label = match art {
         Some(rgba) => rgba,
-        None => generated_label(&s, &label_text(cart)),
+        #[cfg(feature = "nds")]
+        None if cart.platform == Platform::Nds => banner_label(&s, cart),
+        None => {
+            let title = label_text(cart);
+            generated_label(&s, &title, label_colour(&title))
+        }
     };
     paste_label(&s, &mut face, &label);
     clip_to_silhouette(&s, &mut face);
@@ -282,64 +440,6 @@ pub fn label_colour(title: &str) -> [u8; 3] {
 
 pub fn label_text(cart: &Cart) -> String {
     clean_label(&cart.stem)
-}
-
-pub fn clean_label(stem: &str) -> String {
-    let mut bare = String::with_capacity(stem.len());
-    let mut depth = 0u32;
-    for ch in stem.chars() {
-        match ch {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => bare.push(ch),
-            _ => {}
-        }
-    }
-
-    let mut out = String::with_capacity(bare.len());
-    for word in bare.split_whitespace().filter(|w| *w != "-") {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    if out.is_empty() {
-        stem.to_string()
-    } else {
-        out
-    }
-}
-
-pub fn label_tags(stem: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0u32;
-    let mut cur = String::new();
-    for ch in stem.chars() {
-        match ch {
-            '(' | '[' => {
-                depth += 1;
-                if depth == 1 {
-                    cur.clear();
-                    continue;
-                }
-            }
-            ')' | ']' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let t = cur.trim();
-                    if !t.is_empty() {
-                        out.push(t.to_string());
-                    }
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        if depth >= 1 {
-            cur.push(ch);
-        }
-    }
-    out
 }
 
 fn luma(px: &[u8]) -> u32 {
@@ -379,6 +479,8 @@ pub fn neutral_shell(mould: Mould, clear: bool) -> Vec<u8> {
         Mould::Gba => Shape::Gba,
         Mould::Notched => Shape::Gb(GbShell::Notched),
         Mould::Rounded => Shape::Gb(GbShell::Rounded),
+        #[cfg(feature = "nds")]
+        Mould::Ds => Shape::Ds,
     };
     let s = spec(shape);
     assert_eq!(
@@ -442,6 +544,8 @@ fn dress(s: &Spec, rgba: &mut [u8]) {
         Mould::Gba => "GAME BOY ADVANCE",
         Mould::Notched => "GAME BOY",
         Mould::Rounded => "GAME BOY COLOR",
+        #[cfg(feature = "nds")]
+        Mould::Ds => "NINTENDO DS",
     };
     stamp_console(rgba, s.w, s.h, title, y0);
 }
@@ -519,6 +623,10 @@ fn overlay(base: u8, colour: u8) -> u8 {
 }
 
 fn shell_face(s: &Spec, shell: &Shell) -> CartFace {
+    shell_face_of(s, shell, false)
+}
+
+fn shell_face_of(s: &Spec, shell: &Shell, bare: bool) -> CartFace {
     let clear = shell.finish != Finish::Solid;
     let src = bitmaps::shell_asset(s.mould, clear);
     assert_eq!(
@@ -532,11 +640,10 @@ fn shell_face(s: &Spec, shell: &Shell) -> CartFace {
     // The neutral asset is blended with the game's colour everywhere but the label box, which
     // stays the grey of the asset. A clear shell is its own asset with real transparency: what the
     // compositor drew underneath (the board) shows through and stays put while the shell moves.
-    // The label box stays opaque.
     let (lx, ly, lw, lh) = s.label;
     for y in 0..s.h {
         for x in 0..s.w {
-            let on_label = (lx..lx + lw).contains(&x) && (ly..ly + lh).contains(&y);
+            let on_label = !bare && (lx..lx + lw).contains(&x) && (ly..ly + lh).contains(&y);
             let i = ((y * s.w + x) * 4) as usize;
             if !on_label {
                 for c in 0..3 {
@@ -594,9 +701,8 @@ fn lerp(a: [u8; 3], b: [u8; 3], num: u32, den: u32) -> [u8; 3] {
     out
 }
 
-fn generated_label(s: &Spec, title: &str) -> Vec<u8> {
+fn generated_label(s: &Spec, title: &str, bg: [u8; 3]) -> Vec<u8> {
     let (_, _, lw, lh) = s.label;
-    let bg = label_colour(title);
     let mut rgba = Vec::with_capacity((lw * lh * 4) as usize);
     for _ in 0..lw * lh {
         rgba.extend_from_slice(&[bg[0], bg[1], bg[2], 255]);
@@ -605,7 +711,7 @@ fn generated_label(s: &Spec, title: &str) -> Vec<u8> {
     if let Some(font) = text::label_font() {
         let (max_px, max_h) = match s.mould {
             Mould::Gba => (lh as f32 / (MAX_LINES as f32 * 1.36), f32::INFINITY),
-            Mould::Notched | Mould::Rounded => {
+            _ => {
                 let room = (lh - 2 * PAD) as f32;
                 (room / MAX_LINES as f32, room)
             }
@@ -624,12 +730,67 @@ fn generated_label(s: &Spec, title: &str) -> Vec<u8> {
     rgba
 }
 
+#[cfg(feature = "nds")]
+fn banner_label(s: &Spec, cart: &Cart) -> Vec<u8> {
+    let banner = slot_store::read_banner(&cart.rom);
+    let title = banner
+        .as_ref()
+        .map(|b| b.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| label_text(cart));
+    let bg = label_colour(&title);
+    let (_, _, lw, lh) = s.label;
+    let icon_room = lh * 3 / 5;
+    let top = Spec {
+        label: (0, 0, lw, lh - icon_room),
+        ..spec(Shape::Ds)
+    };
+    let text = generated_label(&top, &title, bg);
+    let mut rgba = Vec::with_capacity((lw * lh * 4) as usize);
+    for _ in 0..lw * icon_room {
+        rgba.extend_from_slice(&[bg[0], bg[1], bg[2], 255]);
+    }
+    rgba.extend_from_slice(&text);
+    if let Some(b) = banner {
+        let scale = ((icon_room - PAD) / 32).min((lw - 2 * PAD) / 32).max(1);
+        let (x0, y0) = (
+            (lw - 32 * scale) / 2,
+            (icon_room - 32 * scale) / 2 + PAD / 2,
+        );
+        for y in 0..32 * scale {
+            for x in 0..32 * scale {
+                let src = (((y / scale) * 32 + x / scale) * 4) as usize;
+                let px = &b.icon_rgba[src..src + 4];
+                if px[3] == 0 {
+                    continue;
+                }
+                let dst = (((y0 + y) * lw + x0 + x) * 4) as usize;
+                rgba[dst..dst + 4].copy_from_slice(px);
+            }
+        }
+    }
+    rgba
+}
+
 fn ink(bg: [u8; 3]) -> [u8; 3] {
     let luma = 0.2126 * bg[0] as f32 + 0.7152 * bg[1] as f32 + 0.0722 * bg[2] as f32;
     if luma > 140.0 {
         [0x1a, 0x18, 0x16]
     } else {
         [0xf4, 0xf1, 0xea]
+    }
+}
+
+fn paste_ink(s: &Spec, face: &mut CartFace, colour: [u8; 3], coverage: &[u8]) {
+    paste_label(s, face, &ink_rgba(colour, coverage));
+    let (lx, ly, lw, lh) = s.label;
+    for y in 0..lh {
+        for x in 0..lw {
+            let a = coverage[(y * lw + x) as usize] as u32;
+            let d = (((y + ly) * s.w + x + lx) * 4 + 3) as usize;
+            let under = face.rgba[d] as u32;
+            face.rgba[d] = (a + under * (255 - a) / 255).min(255) as u8;
+        }
     }
 }
 

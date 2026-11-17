@@ -1,6 +1,7 @@
-use slot_store::GbPalette;
+use slot_store::{GbColors, GbPalette};
 use slot_ui::{
-    toast_face, toast_rect, Canvas, Draw, Hud, HudKind, Toast, ALARM_BAND_H, OUT_H, OUT_W, PLATE_H,
+    toast_face, toast_face_text, toast_rect, Canvas, Draw, Hud, HudKind, Icon, QuickRow, TexId,
+    Toast, ALARM_BAND_H, OUT_H, OUT_W, PLATE_H,
 };
 
 #[test]
@@ -17,22 +18,41 @@ fn the_link_shortcut_on_the_wrong_core_says_to_switch() {
 }
 
 #[test]
+fn sunlight_on_gpsp_says_to_switch_to_mgba() {
+    assert_eq!(Toast::NeedsMgba.text(), "Please switch to mGBA");
+    let f = toast_face(Toast::NeedsMgba);
+    assert!(f.rgba.chunks(4).any(|p| p[3] > 0), "the banner is blank");
+}
+
+#[test]
 fn a_cart_gpsp_cannot_link_says_there_is_no_link() {
     assert_eq!(Toast::NoLink.text(), "No link support");
+    assert_eq!(Toast::NoWifi.text(), "This device has no Wi-Fi");
     let f = toast_face(Toast::NoLink);
     assert!(f.rgba.chunks(4).any(|p| p[3] > 0), "the banner is blank");
+}
+
+#[test]
+fn the_link_ending_says_who_ended_it() {
+    assert_eq!(Toast::LinkEnded.text(), "Link ended");
+    assert_eq!(Toast::PeerEnded.text(), "Your friend unplugged");
 }
 
 #[test]
 fn the_banner_says_what_happened_and_never_what_is_on_screen() {
     let all = Toast::all();
     assert_eq!(
-        all[..15],
+        all[..32],
         [
             Toast::StateSaved,
             Toast::StateLoaded,
+            Toast::GameReset,
+            Toast::ShotCaptured,
+            Toast::ShotFailed,
             Toast::NeedsGpsp,
+            Toast::NeedsMgba,
             Toast::NoLink,
+            Toast::NoWifi,
             Toast::LinkEnded,
             Toast::PeerEnded,
             Toast::BiosMismatch,
@@ -43,14 +63,37 @@ fn the_banner_says_what_happened_and_never_what_is_on_screen() {
             Toast::ShaderGrid,
             Toast::ShaderDot,
             Toast::ShaderSimpletex,
+            Toast::ShaderShimmerless,
             Toast::CardUnwritable,
+            Toast::CardRepair,
+            Toast::CardRepairCharge,
+            Toast::CardRepaired,
+            Toast::CardRepairFailed,
+            Toast::Forgotten,
+            Toast::Collection,
+            Toast::KidUnlocked,
+            Toast::TintOff,
+            Toast::TintLow,
+            Toast::TintMedium,
+            Toast::TintHigh,
         ],
         "a banner was added or dropped: every face is uploaded by its place in this list"
     );
+    let palettes = GbColors::all().count();
+    assert_eq!(palettes, 49);
     assert_eq!(
-        all[15..],
-        GbPalette::all().map(Toast::Palette).collect::<Vec<_>>()[..],
+        all[32..32 + palettes],
+        GbColors::all().map(Toast::Palette).collect::<Vec<_>>()[..],
         "the palette banners do not follow the fixed ones in palette order"
+    );
+    assert_eq!(
+        all[32 + palettes..],
+        QuickRow::ALL
+            .into_iter()
+            .filter(|r| r.binds())
+            .map(Toast::Duplicate)
+            .collect::<Vec<_>>()[..],
+        "the duplicate warnings do not follow the palettes in row order"
     );
     for (i, t) in all.iter().enumerate() {
         assert_eq!(t.index(), i, "{t:?} does not answer to its own place");
@@ -66,9 +109,18 @@ fn the_banner_says_what_happened_and_never_what_is_on_screen() {
 fn no_toast_is_shrunk_to_fit_its_box() {
     let rows = |t: Toast| {
         let f = toast_face(t);
-        let inked: Vec<usize> = (0..f.h as usize)
-            .filter(|y| (0..f.w as usize).any(|x| f.rgba[(y * f.w as usize + x) * 4 + 3] > 0))
-            .collect();
+        let (w, h) = (f.w as usize, f.h as usize);
+        let ink = |x: usize, y: usize| f.rgba[(y * w + x) * 4 + 3] > 0;
+        let mut from = 0;
+        if t.icon().is_some() {
+            let cols: Vec<usize> = (0..w).filter(|x| (0..h).any(|y| ink(*x, y))).collect();
+            let gap = cols
+                .windows(2)
+                .position(|p| p[1] - p[0] > 3)
+                .expect("no icon gap");
+            from = cols[gap + 1];
+        }
+        let inked: Vec<usize> = (0..h).filter(|y| (from..w).any(|x| ink(x, *y))).collect();
         let first = *inked.first().expect("the banner is blank");
         let last = *inked.last().expect("the banner is blank");
         (first, last)
@@ -168,7 +220,11 @@ fn a_toast_takes_the_band_from_the_bar() {
 #[test]
 fn a_palette_banner_names_the_palette_without_its_boot_combo() {
     let p = GbPalette::parse("GBC Dark Green →A").unwrap();
-    assert_eq!(Toast::Palette(p).text(), "GBC Dark Green");
+    assert_eq!(
+        Toast::Palette(GbColors::Palette(p)).text(),
+        "GBC Dark Green"
+    );
+    assert_eq!(Toast::Palette(GbColors::Auto).text(), "Auto");
 }
 
 fn band(h: &Hud, now: u64) -> Option<(f32, f32, [f32; 4])> {
@@ -281,4 +337,218 @@ fn the_card_alarm_inks_both_of_its_lines() {
     let half = f.h / 2;
     assert!(inked(0..half), "the first line is blank");
     assert!(inked(half + 8..f.h), "the second line is blank");
+}
+
+#[test]
+fn a_card_that_can_be_repaired_says_how() {
+    assert!(Toast::CardRepair.alarm());
+    assert_eq!(Toast::CardRepair.text(), Toast::CardUnwritable.text());
+    assert_eq!(
+        Toast::CardRepair.detail(),
+        Some("Press SELECT + START to repair")
+    );
+    assert!(!Toast::CardRepaired.alarm());
+    assert!(!Toast::CardRepairFailed.alarm());
+}
+
+#[test]
+fn the_alarm_band_carries_the_banner_it_was_given() {
+    let ids: Vec<TexId> = (0..Toast::all().len()).map(TexId::from_raw).collect();
+    let alarm_tex = |h: &Hud| {
+        let mut out = Vec::new();
+        h.draw(Canvas::FRAMED, 0, &mut out);
+        out.iter().find_map(|d| match d {
+            Draw::Tex { tex, .. } => Some(*tex),
+            _ => None,
+        })
+    };
+    let mut h = Hud::new();
+    h.set_toasts(ids.clone());
+    h.set_alarm(true, 0);
+    assert_eq!(alarm_tex(&h), Some(ids[Toast::CardUnwritable.index()]));
+    h.set_alarm_toast(Toast::CardRepair);
+    assert_eq!(alarm_tex(&h), Some(ids[Toast::CardRepair.index()]));
+}
+
+#[test]
+fn the_repair_prompt_line_keeps_every_word() {
+    let f = slot_ui::menu_detail_face("slot restarts when it is done.");
+    let inked: Vec<bool> = (0..f.w as usize)
+        .map(|x| (0..f.h as usize).any(|y| f.rgba[(y * f.w as usize + x) * 4 + 3] > 0))
+        .collect();
+    let first = inked.iter().position(|i| *i).expect("blank line");
+    let last = inked.iter().rposition(|i| *i).unwrap();
+    let mut gaps = 0;
+    let mut run = 0;
+    for i in &inked[first..=last] {
+        if *i {
+            if run >= 7 {
+                gaps += 1;
+            }
+            run = 0;
+        } else {
+            run += 1;
+        }
+    }
+    assert_eq!(gaps + 1, 6, "the line kept {} of its 6 words", gaps + 1);
+}
+
+#[test]
+fn a_repair_result_stays_up_longer_than_a_toast() {
+    for t in [Toast::CardRepaired, Toast::CardRepairFailed] {
+        let mut h = Hud::new();
+        h.toast(t, 1_000);
+        assert!(h.toast_visible(6_999), "{t:?} went before it could be read");
+        assert!(!h.toast_visible(7_000), "{t:?} never went");
+    }
+}
+
+#[test]
+fn the_shot_toast_says_screenshot_captured_beside_a_camera() {
+    assert_eq!(Toast::ShotCaptured.text(), "Screenshot Captured");
+    assert_eq!(Toast::ShotCaptured.icon(), Some(Icon::Camera));
+    let f = toast_face(Toast::ShotCaptured);
+    let beside = toast_face(Toast::Duplicate(QuickRow::ScSave));
+    assert_eq!(
+        (f.w, f.h),
+        (beside.w, beside.h),
+        "the camera is not laid out beside the words"
+    );
+    let warning = f
+        .rgba
+        .chunks(4)
+        .any(|p| p[3] > 0xc0 && p[0] > 0xf0 && (0xa0..0xd0).contains(&p[1]) && p[2] < 0x50);
+    assert!(!warning, "the camera is inked like a warning");
+}
+
+#[test]
+fn a_failed_shot_says_so_beside_the_alert() {
+    assert_eq!(Toast::ShotFailed.text(), "Screenshot Failed");
+    assert_eq!(Toast::ShotFailed.icon(), Some(Icon::Alert));
+}
+
+fn ink_bands(f: &slot_ui::CartFace) -> Vec<(u32, u32, u32)> {
+    let lit = |x: u32, y: u32| {
+        let p = &f.rgba[((y * f.w + x) * 4) as usize..][..4];
+        p[3] > 0x80 && p[0] > 0x80
+    };
+    let mut bands = Vec::new();
+    let mut open: Option<u32> = None;
+    for y in 0..=f.h {
+        let inked = y < f.h && (0..f.w).any(|x| lit(x, y));
+        match (inked, open) {
+            (true, None) => open = Some(y),
+            (false, Some(top)) => {
+                let cols: Vec<u32> = (0..f.w)
+                    .filter(|x| (top..y).any(|yy| lit(*x, yy)))
+                    .collect();
+                bands.push((
+                    top,
+                    y - top,
+                    cols.last().unwrap() - cols.first().unwrap() + 1,
+                ));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    bands
+}
+
+#[test]
+fn a_short_toast_stays_on_one_line() {
+    let f = toast_face_text(Toast::Collection, "Added 2 to Pokemon");
+    assert_eq!(ink_bands(&f).len(), 1, "{:?}", ink_bands(&f));
+}
+
+#[test]
+fn a_long_toast_wraps_onto_two_even_lines_at_full_size() {
+    let short = ink_bands(&toast_face(Toast::StateSaved));
+    let f = toast_face_text(
+        Toast::Collection,
+        "Removed from A Very Long Collection Name",
+    );
+    let bands = ink_bands(&f);
+    assert_eq!(bands.len(), 2, "{bands:?}");
+    for (_, h, _) in &bands {
+        assert_eq!(
+            *h, short[0].1,
+            "a wrapped line was shrunk: {bands:?} against {short:?}"
+        );
+    }
+    let (a, b) = (bands[0].2, bands[1].2);
+    assert!(
+        a.min(b) * 10 >= a.max(b) * 6,
+        "the lines are {a} and {b} px wide"
+    );
+}
+
+#[test]
+fn a_toast_is_set_the_size_of_the_shelf_title() {
+    let toast = ink_bands(&toast_face(Toast::StateSaved))[0].1;
+    let heading = slot_ui::heading_text_face("State Saved", true);
+    let title = ink_bands(&slot_ui::CartFace {
+        rgba: heading.rgba,
+        w: heading.w,
+        h: heading.h,
+    })[0]
+        .1;
+    assert_eq!(toast, title);
+}
+
+#[test]
+fn a_two_line_toast_deepens_the_band_to_hold_it() {
+    let mut h = Hud::new();
+    h.set_toasts((0..Toast::all().len()).map(TexId::from_raw).collect());
+    h.toast_saying(
+        Toast::Collection,
+        "Removed from A Very Long Collection Name",
+        0,
+    );
+    let mut out = Vec::new();
+    h.draw(Canvas::FRAMED, 0, &mut out);
+    let band = out
+        .iter()
+        .find_map(|d| match d {
+            Draw::Rect { w, h, .. } if *w == OUT_W as f32 => Some(*h),
+            _ => None,
+        })
+        .unwrap();
+    let (y, th) = out
+        .iter()
+        .find_map(|d| match d {
+            Draw::Tex { y, h, .. } => Some((*y, *h)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(band > PLATE_H, "the band stayed {band} px");
+    assert!(
+        y >= 0.0 && y + th <= band,
+        "the toast at {y}+{th} spills out of a {band} px band"
+    );
+}
+
+#[test]
+fn an_edit_heading_is_set_the_size_of_a_toast() {
+    let toast = ink_bands(&toast_face(Toast::StateSaved))[0].1;
+    let heading = slot_ui::heading_text_face("State Saved", false);
+    let set = ink_bands(&slot_ui::CartFace {
+        rgba: heading.rgba,
+        w: heading.w,
+        h: heading.h,
+    })[0]
+        .1;
+    assert_eq!(set, toast);
+}
+
+#[test]
+fn the_kid_mode_unlock_toast_stays_on_one_line() {
+    let f = toast_face(Toast::KidUnlocked);
+    assert_eq!(ink_bands(&f).len(), 1, "{:?}", ink_bands(&f));
+    assert_eq!(Toast::KidUnlocked.text(), "Kid Mode is off until restart");
+}
+
+#[test]
+fn the_lcd_shader_toast_says_lcd_on_every_panel() {
+    assert_eq!(Toast::ShaderLcd3x.text(), "Shader: LCD");
 }

@@ -94,6 +94,36 @@ fn undoing_a_load_returns_the_emulator_to_the_prior_state() {
 }
 
 #[test]
+fn a_reset_starts_the_game_over_and_undoing_it_puts_the_game_back() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let core = CoreSnapshot::new();
+    let mut a = app_playing_with(d.path(), "Emerald", core.boxed());
+    let start = core.bytes();
+    for _ in 0..120 {
+        core.run_frame();
+    }
+    let before = core.bytes();
+    a.apply_at(Action::Reset, 1_000);
+    assert_eq!(core.bytes(), start);
+    assert_eq!(a.undo_label(), Some("undo reset"));
+    a.undo(2_000);
+    assert_eq!(core.bytes(), before);
+}
+
+#[test]
+fn a_reset_is_refused_while_linked() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let core = CoreSnapshot::new();
+    let mut a = app_playing_with(d.path(), "Emerald", core.boxed());
+    core.run_frame();
+    let before = core.bytes();
+    a.begin_link(0);
+    a.apply_at(Action::Reset, 1_000);
+    assert_eq!(core.bytes(), before);
+    assert!(!a.undo_available(1_000));
+}
+
+#[test]
 fn undo_is_not_offered_when_nothing_is_undoable() {
     let d = tmp_root_with_carts(&["Emerald"]);
     let a = app_playing_in(d.path(), "Emerald");
@@ -170,4 +200,32 @@ fn the_plate_is_drawn_only_over_the_switcher_and_only_while_the_offer_stands() {
         expired.len() + 1,
         "the plate outlived the offer"
     );
+}
+
+#[test]
+fn undo_load_in_the_menu_returns_the_emulator_to_the_prior_state() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let core = CoreSnapshot::new();
+    let mut a = app_playing_with(d.path(), "Emerald", core.boxed());
+    core.run_frame();
+    a.apply_at(Action::SaveState, 500);
+    for _ in 0..120 {
+        core.run_frame();
+    }
+    let before = core.bytes();
+    a.apply_at(Action::LoadState, 1_000);
+    a.apply_at(Action::QuickMenu, 1_100);
+    let mut at = 1_200;
+    common::reach(
+        &mut a,
+        slot_ui::QuickRow::UndoLoad,
+        |a| a.in_game_menu(),
+        |a| {
+            a.apply_at(Action::GbaDown(Btn::Down), at);
+            a.apply_at(Action::GbaUp(Btn::Down), at + 50);
+            at += 100;
+        },
+    );
+    a.apply_at(Action::GbaDown(Btn::A), at);
+    assert_eq!(core.bytes(), before);
 }

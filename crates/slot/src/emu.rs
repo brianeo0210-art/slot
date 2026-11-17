@@ -1,15 +1,12 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cable::{self, Cable};
-use slot_retro::{
-    ButtonMask, CoreError, Link, LinkChannel, RetroCore, Rumble, GBA_H, GBA_W, NETPACKET_RELIABLE,
-};
-use slot_store::RUN_AHEAD_MAX;
+use slot_retro::{mask_for, ButtonMask, Link, LinkChannel, RetroCore, Rumble, NETPACKET_RELIABLE};
 
 use crate::audio::Ring;
 use crate::drc::{drc_ratio, drc_target};
@@ -35,9 +32,15 @@ const STALL: Duration = Duration::from_millis(25);
 
 const RATE_WINDOW: u32 = 300;
 
+const MAX_CATCH_UP: u64 = 3;
+
 const TRACE_EVERY: u64 = 300;
 
 const MAX_LINK_PACKETS_PER_PRESENT: u32 = 256;
+
+const ANSWER_WAIT: Duration = Duration::from_secs(2);
+
+const STOP_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Speed {
@@ -82,23 +85,25 @@ enum Cmd {
     BeginCable(u8, Box<dyn LinkChannel>),
     SetOption(String, String),
     Refresh,
+    Reset,
 }
 
 struct Shared {
     input: AtomicU16,
+    touch: AtomicU32,
+    lid: AtomicBool,
     speed: AtomicU8,
     observed: AtomicU8,
     state: AtomicU8,
     rewind: AtomicBool,
     rewind_fill: AtomicU8,
-    turbo: AtomicBool,
     recording: AtomicBool,
     stop: AtomicBool,
     volume: AtomicU8,
-    fast_steps: AtomicU32,
+    fast_quarters: AtomicU32,
     ff_sound: AtomicBool,
-    runahead: AtomicU8,
     published: AtomicU64,
+    cuts: AtomicU64,
     resume_refused: AtomicBool,
     sav_refused: AtomicBool,
     link_lost: AtomicBool,
@@ -106,6 +111,7 @@ struct Shared {
     peer_ended: AtomicBool,
     bios_mismatch: AtomicBool,
     driven: AtomicBool,
+    fixed_present: AtomicBool,
     locked: AtomicBool,
     present_ns: AtomicU64,
     requested: AtomicBool,
@@ -117,6 +123,31 @@ struct Shared {
 struct Clock {
     tick: u64,
     done: u64,
+    sent: Option<Instant>,
+}
+
+impl Shared {
+    fn next_tick(&self, served: u64, until: Instant) -> Wait {
+        let mut clock = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if clock.tick > served {
+                return Wait::Tick(clock.tick, clock.sent.unwrap_or_else(Instant::now));
+            }
+            if self.requested.swap(false, Ordering::AcqRel) {
+                return Wait::Request;
+            }
+            let Some(left) = until.checked_duration_since(Instant::now()) else {
+                return Wait::Late;
+            };
+            if self.stop.load(Ordering::Relaxed) || !self.driven.load(Ordering::Relaxed) {
+                return Wait::Late;
+            }
+            clock = match self.clocked.wait_timeout(clock, left) {
+                Ok((c, _)) => c,
+                Err(e) => e.into_inner().0,
+            };
+        }
+    }
 }
 
 impl EmuHandle {
@@ -141,6 +172,14 @@ impl EmuHandle {
         Self::spawn_as(core, rom, ring, sav, resume, Some(player))
     }
 
+    pub fn refuse_save_ram(&self) {
+        self.shared.sav_refused.store(true, Ordering::Release);
+    }
+
+    pub fn refuse_resume(&self) {
+        self.shared.resume_refused.store(true, Ordering::Release);
+    }
+
     fn spawn_as(
         core: Box<dyn RetroCore>,
         rom: PathBuf,
@@ -151,22 +190,24 @@ impl EmuHandle {
     ) -> Self {
         let rumble = core.rumble();
         let link = core.net();
-        let frames = Frames::new((GBA_W * GBA_H * 4) as usize);
+        let (w, h) = core.video_size();
+        let frames = Frames::new((w * h * 4) as usize);
         let shared = Arc::new(Shared {
             input: AtomicU16::new(0),
+            touch: AtomicU32::new(NO_TOUCH),
+            lid: AtomicBool::new(false),
             speed: AtomicU8::new(Speed::Paused as u8),
             observed: AtomicU8::new(Speed::Paused as u8),
             state: AtomicU8::new(CoreState::Loading as u8),
             rewind: AtomicBool::new(false),
             rewind_fill: AtomicU8::new(0),
-            turbo: AtomicBool::new(true),
             recording: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             volume: AtomicU8::new(100),
-            fast_steps: AtomicU32::new(FAST_STEPS),
+            fast_quarters: AtomicU32::new(FAST_STEPS * 4),
             ff_sound: AtomicBool::new(false),
-            runahead: AtomicU8::new(0),
             published: AtomicU64::new(0),
+            cuts: AtomicU64::new(0),
             resume_refused: AtomicBool::new(false),
             sav_refused: AtomicBool::new(false),
             link_lost: AtomicBool::new(false),
@@ -174,6 +215,7 @@ impl EmuHandle {
             peer_ended: AtomicBool::new(false),
             bios_mismatch: AtomicBool::new(false),
             driven: AtomicBool::new(false),
+            fixed_present: AtomicBool::new(false),
             locked: AtomicBool::new(false),
             present_ns: AtomicU64::new(PRESENT.as_nanos() as u64),
             requested: AtomicBool::new(false),
@@ -255,6 +297,10 @@ impl EmuHandle {
         );
     }
 
+    pub fn set_fixed_present(&self, fixed: bool) {
+        self.shared.fixed_present.store(fixed, Ordering::Relaxed);
+    }
+
     pub fn set_driven(&self, driven: bool) {
         self.shared.driven.store(driven, Ordering::Relaxed);
         self.shared.clocked.notify_all();
@@ -270,7 +316,14 @@ impl EmuHandle {
             .store(present.as_nanos() as u64, Ordering::Relaxed);
         let mut clock = self.shared.clock.lock().unwrap_or_else(|e| e.into_inner());
         clock.tick += 1;
+        clock.sent = Some(Instant::now());
         self.shared.clocked.notify_all();
+    }
+
+    pub fn step_ahead(&self, present: Duration, timeout: Duration) -> bool {
+        let ready = self.wait_frame(timeout);
+        self.tick(present);
+        !ready && self.locked()
     }
 
     pub fn wait_frame(&self, timeout: Duration) -> bool {
@@ -298,6 +351,14 @@ impl EmuHandle {
         crate::latency::applied(before, mask.0);
     }
 
+    pub fn set_touch(&self, at: Option<(u8, u8)>) {
+        self.shared.touch.store(pack_touch(at), Ordering::Relaxed);
+    }
+
+    pub fn set_lid(&self, shut: bool) {
+        self.shared.lid.store(shut, Ordering::Relaxed);
+    }
+
     pub fn input(&self) -> ButtonMask {
         ButtonMask(self.shared.input.load(Ordering::Relaxed))
     }
@@ -322,6 +383,10 @@ impl EmuHandle {
         self.frames.taken()
     }
 
+    pub fn cuts(&self) -> u64 {
+        self.shared.cuts.load(Ordering::Relaxed)
+    }
+
     pub fn published_count(&self) -> u64 {
         self.shared.published.load(Ordering::Relaxed)
     }
@@ -334,14 +399,14 @@ impl EmuHandle {
         self.shared.volume.store(level.min(100), Ordering::Relaxed);
     }
 
-    pub fn set_fast_steps(&self, steps: u32) {
+    pub fn set_fast_quarters(&self, quarters: u32) {
         self.shared
-            .fast_steps
-            .store(steps.clamp(1, FAST_STEPS_MAX), Ordering::Relaxed);
+            .fast_quarters
+            .store(quarters.clamp(4, FAST_STEPS_MAX * 4), Ordering::Relaxed);
     }
 
-    pub fn fast_steps(&self) -> u32 {
-        self.shared.fast_steps.load(Ordering::Relaxed)
+    pub fn fast_quarters(&self) -> u32 {
+        self.shared.fast_quarters.load(Ordering::Relaxed)
     }
 
     pub fn set_ff_sound(&self, on: bool) {
@@ -352,22 +417,8 @@ impl EmuHandle {
         self.shared.ff_sound.load(Ordering::Relaxed)
     }
 
-    pub fn set_runahead(&self, frames: u8) {
-        self.shared
-            .runahead
-            .store(frames.min(RUN_AHEAD_MAX), Ordering::Relaxed);
-    }
-
-    pub fn runahead(&self) -> u8 {
-        self.shared.runahead.load(Ordering::Relaxed)
-    }
-
     pub fn set_rewinding(&self, on: bool) {
         self.shared.rewind.store(on, Ordering::Relaxed);
-    }
-
-    pub fn set_turbo(&self, on: bool) {
-        self.shared.turbo.store(on, Ordering::Relaxed);
     }
 
     pub fn set_rewind_recording(&self, on: bool) {
@@ -418,23 +469,27 @@ impl Snapshot for EmuSnapshot {
     fn state(&self) -> Option<Vec<u8>> {
         let (tx, rx) = channel();
         request(&self.cmds, &self.shared, Cmd::Save(tx)).then_some(())?;
-        rx.recv().ok()
+        answer(rx, "state")
     }
 
     fn save_ram(&self) -> Option<Vec<u8>> {
         let (tx, rx) = channel();
         request(&self.cmds, &self.shared, Cmd::Sav(tx)).then_some(())?;
-        rx.recv().ok().flatten()
+        answer(rx, "save ram").flatten()
     }
 
     fn thumb(&self) -> Option<Vec<u8>> {
         let (tx, rx) = channel();
         request(&self.cmds, &self.shared, Cmd::Thumb(tx)).then_some(())?;
-        rx.recv().ok().flatten()
+        answer(rx, "thumbnail").flatten()
     }
 
     fn load(&self, state: Vec<u8>) {
         request(&self.cmds, &self.shared, Cmd::Load(state));
+    }
+
+    fn reset(&self) {
+        request(&self.cmds, &self.shared, Cmd::Reset);
     }
 
     fn resume_trusted(&self) -> bool {
@@ -443,6 +498,20 @@ impl Snapshot for EmuSnapshot {
 
     fn save_ram_trusted(&self) -> bool {
         !self.shared.sav_refused.load(Ordering::Acquire)
+    }
+}
+
+fn answer<T>(rx: Receiver<T>, what: &str) -> Option<T> {
+    match rx.recv_timeout(ANSWER_WAIT) {
+        Ok(v) => Some(v),
+        Err(RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "slot: emu: no {what} after {} s, the core is not answering",
+                ANSWER_WAIT.as_secs()
+            );
+            None
+        }
+        Err(RecvTimeoutError::Disconnected) => None,
     }
 }
 
@@ -457,7 +526,7 @@ fn request(cmds: &Sender<Cmd>, shared: &Shared, cmd: Cmd) -> bool {
 }
 
 enum Wait {
-    Tick(u64),
+    Tick(u64, Instant),
     Request,
     Late,
 }
@@ -467,6 +536,20 @@ impl Drop for EmuHandle {
         eprintln!("slot: emu: stopping at {:.1} ms", crate::boot_time::ms());
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
+            let deadline = Instant::now() + STOP_WAIT;
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !join.is_finished() {
+                eprintln!(
+                    "slot: emu: the core has not stopped after {} s",
+                    STOP_WAIT.as_secs()
+                );
+                #[cfg(feature = "device")]
+                unsafe {
+                    libc::_exit(75)
+                };
+            }
             let _ = join.join();
         }
         eprintln!("slot: emu: stopped at {:.1} ms", crate::boot_time::ms());
@@ -562,7 +645,7 @@ impl Worker {
         let mut fast_span: Option<(Instant, Duration)> = None;
         let mut deadline = Instant::now();
         let mut served = 0u64;
-        let mut ticked = false;
+        let mut due = 0u32;
         let mut paced = 0u64;
         let mut scale = 0.0f64;
         let mut rate = TickRate::new(Instant::now(), 0);
@@ -576,7 +659,7 @@ impl Worker {
         let mut cable_core = Duration::ZERO;
         let mut cable_wait = Duration::ZERO;
         let mut ff = (0u32, 0u32, Duration::ZERO, Instant::now());
-        let mut runahead = RunAhead::default();
+        let mut owed = 0u32;
         while !self.shared.stop.load(Ordering::Relaxed) {
             for cmd in self.cmds.try_iter() {
                 self.apply(cmd, core.as_mut(), &mut transport, &mut cable, &link);
@@ -596,10 +679,13 @@ impl Worker {
                             } else {
                                 match core.unserialize(&state) {
                                     Ok(()) => {
+                                        self.shared.cuts.fetch_add(1, Ordering::Relaxed);
                                         eprintln!(
                                         "slot: cable: restored {} bytes, running the host's game",
                                         state.len()
                                     );
+                                        self.shared.sav_refused.store(true, Ordering::Release);
+                                        self.shared.resume_refused.store(true, Ordering::Release);
                                         c.prime();
                                         t.send(NETPACKET_RELIABLE, &cable::ready_packet());
                                     }
@@ -643,22 +729,25 @@ impl Worker {
                 rate.restart(deadline, self.current_tick());
                 self.shared.clocked.notify_all();
             }
-            let ahead =
-                if speed == Speed::Normal && !rewinding && transport.is_none() && !runahead.refused
-                {
-                    u32::from(self.shared.runahead.load(Ordering::Relaxed))
-                } else {
-                    0
-                };
             let input = ButtonMask(self.shared.input.load(Ordering::Relaxed));
+            core.set_touch(unpack_touch(self.shared.touch.load(Ordering::Relaxed)));
+            core.set_lid(self.shared.lid.load(Ordering::Relaxed));
             crate::latency::emu_frame(input.0);
             let mut span = 1u32;
             let ceiling = match speed {
                 Speed::Paused => 0,
-                Speed::Normal if lock && !ticked => 0,
+                Speed::Normal if lock => due,
                 Speed::Normal => 1,
-                Speed::Fast => self.shared.fast_steps.load(Ordering::Relaxed),
+                Speed::Fast => {
+                    owed += self.shared.fast_quarters.load(Ordering::Relaxed);
+                    let whole = owed / 4;
+                    owed %= 4;
+                    whole
+                }
             };
+            if speed != Speed::Fast {
+                owed = 0;
+            }
             if rewinding {
                 if let Some(state) = rewind.pop() {
                     if let Err(e) = core.unserialize(&state) {
@@ -677,19 +766,22 @@ impl Worker {
                 if speed == Speed::Fast {
                     span = cost.span(one, ceiling);
                 }
-                let ceiling = ceiling * span;
+                if lock && speed == Speed::Normal {
+                    span = ceiling;
+                }
+                let ceiling = match lock && speed == Speed::Normal {
+                    true => ceiling,
+                    false => ceiling * span,
+                };
                 let budget = one + PRESENT * (span - 1);
                 let began = Instant::now();
                 let mut ran = 0u32;
                 let (mut skipped, mut drawn) = (None::<Duration>, Duration::ZERO);
-                let mut shown = false;
                 loop {
                     ran += 1;
-                    let last = ran >= ceiling || cost.last(began.elapsed(), budget);
-                    let input = match self.shared.turbo.load(Ordering::Relaxed) {
-                        true => input.turbo(turbo_frame),
-                        false => input.without_turbo(),
-                    };
+                    let last = ran >= ceiling
+                        || (speed == Speed::Fast && cost.last(began.elapsed(), budget));
+                    let input = mask_for(core.takes_xy(), input, turbo_frame);
                     turbo_frame = turbo_frame.wrapping_add(1);
                     core.set_frame_skip(!last);
                     let frame_began = Instant::now();
@@ -731,13 +823,6 @@ impl Worker {
                                 }
                             }
                         }
-                        None if ahead > 0 => match runahead.run(core.as_mut(), input, ahead) {
-                            Ok(()) => shown = true,
-                            Err(e) => {
-                                eprintln!("slot: run-ahead: {e}, off for this game");
-                                runahead.refused = true;
-                            }
-                        },
                         None => core.run_frame(input),
                     }
                     let took = frame_began.elapsed();
@@ -751,9 +836,7 @@ impl Worker {
                     }
                 }
                 let core_time = began.elapsed();
-                if ahead == 0 {
-                    cost.measured(skipped, drawn);
-                }
+                cost.measured(skipped, drawn);
                 if cable.is_some() {
                     cable_presents += 1;
                     cable_core += core_time;
@@ -794,11 +877,7 @@ impl Worker {
                     }
                 }
                 flush_outbound(&mut transport, &link);
-                self.publish(if shown {
-                    &runahead.video
-                } else {
-                    core.video_xrgb8888()
-                });
+                self.publish(core.video_xrgb8888());
                 self.frame_done(served);
 
                 since_snapshot += 1;
@@ -810,11 +889,7 @@ impl Worker {
                 }
                 if since_snapshot >= SNAPSHOT_EVERY {
                     since_snapshot = 0;
-                    let state = match shown {
-                        true => Ok(std::mem::take(&mut runahead.state)),
-                        false => core.serialize(),
-                    };
-                    if let Ok(state) = state {
+                    if let Ok(state) = core.serialize() {
                         rewind.push(state);
                         self.shared
                             .rewind_fill
@@ -822,11 +897,7 @@ impl Worker {
                     }
                 }
 
-                let audio = if shown {
-                    std::mem::take(&mut runahead.audio)
-                } else {
-                    core.take_audio()
-                };
+                let audio = core.take_audio();
                 if speed == Speed::Normal || ff_sound {
                     let target = drc_target(ring.capacity_frames());
                     let queued = ring.queued_frames();
@@ -848,7 +919,8 @@ impl Worker {
                     if crate::session::trace() && paced.is_multiple_of(TRACE_EVERY) {
                         let (dropped, starved) = (ring.overruns(), ring.underruns());
                         eprintln!(
-                            "slot: audio: {queued}/{target} queued, {dropped} dropped, {starved} starved, locked {lock} at {scale:.5}"
+                            "slot: audio: {queued}/{target} queued, {dropped} dropped, {starved} starved, {} xruns, locked {lock} at {scale:.5}",
+                            ring.xruns()
                         );
                     }
                 }
@@ -862,11 +934,20 @@ impl Worker {
                 let patience = if stalled { PRESENT } else { STALL };
                 let until = Instant::now() + patience;
                 loop {
-                    match self.next_tick(served, until) {
-                        Wait::Tick(tick) => {
+                    match self.shared.next_tick(served, until) {
+                        Wait::Tick(tick, sent) => {
+                            due = match tick - served {
+                                n if n <= MAX_CATCH_UP => n as u32,
+                                _ => 1,
+                            };
                             served = tick;
                             stalled = false;
-                            if let Some(measured) = rate.served(Instant::now(), tick) {
+                            let fixed = self.shared.fixed_present.load(Ordering::Relaxed);
+                            if fixed {
+                                scale = self.shared.present_ns.load(Ordering::Relaxed) as f64
+                                    / PRESENT.as_nanos() as f64;
+                            }
+                            if let Some(measured) = lock_scale(fixed, &mut rate, sent, tick) {
                                 scale = measured;
                             }
                         }
@@ -879,14 +960,14 @@ impl Worker {
                         Wait::Late => {
                             rate.stalled();
                             stalled = true;
+                            due = 1;
                         }
                     }
                     break;
                 }
-                ticked = true;
                 continue;
             }
-            ticked = false;
+            due = 0;
             deadline += PRESENT * span;
             let now = Instant::now();
             match deadline.checked_duration_since(now) {
@@ -899,9 +980,9 @@ impl Worker {
         }
         ring.set_muted(false);
         ring.set_idle(false);
-        let (dropped, starved) = (ring.overruns(), ring.underruns());
-        if dropped > 0 || starved > 0 || crate::session::trace() {
-            eprintln!("slot: audio: {dropped} samples dropped, {starved} starved");
+        let (dropped, starved, xruns) = (ring.overruns(), ring.underruns(), ring.xruns());
+        if dropped > 0 || starved > 0 || xruns > 0 || crate::session::trace() {
+            eprintln!("slot: audio: {dropped} samples dropped, {starved} starved, {xruns} xruns");
         }
     }
 
@@ -924,9 +1005,11 @@ impl Worker {
                 if let Err(e) = core.unserialize(&self.for_core(state)) {
                     eprintln!("slot: {e}");
                 }
+                self.shared.cuts.fetch_add(1, Ordering::Relaxed);
             }
             Cmd::Refresh => match core.serialize() {
                 Ok(state) => {
+                    self.shared.cuts.fetch_add(1, Ordering::Relaxed);
                     core.set_frame_skip(true);
                     core.run_frame(ButtonMask(0));
                     core.set_frame_skip(false);
@@ -978,6 +1061,10 @@ impl Worker {
             Cmd::SetOption(key, value) => {
                 core.set_option(&key, &value);
             }
+            Cmd::Reset => {
+                core.reset();
+                self.shared.cuts.fetch_add(1, Ordering::Relaxed);
+            }
             Cmd::EndLink => {
                 self.shared.link_lost.store(false, Ordering::Relaxed);
                 self.shared.peer_ended.store(false, Ordering::Relaxed);
@@ -1010,35 +1097,12 @@ impl Worker {
             .tick
     }
 
-    fn next_tick(&self, served: u64, until: Instant) -> Wait {
-        let mut clock = self.shared.clock.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if clock.tick > served {
-                return Wait::Tick(clock.tick);
-            }
-            if self.shared.requested.swap(false, Ordering::AcqRel) {
-                return Wait::Request;
-            }
-            let Some(left) = until.checked_duration_since(Instant::now()) else {
-                return Wait::Late;
-            };
-            if self.shared.stop.load(Ordering::Relaxed)
-                || !self.shared.driven.load(Ordering::Relaxed)
-            {
-                return Wait::Late;
-            }
-            clock = match self.shared.clocked.wait_timeout(clock, left) {
-                Ok((c, _)) => c,
-                Err(e) => e.into_inner().0,
-            };
-        }
-    }
-
     fn publish(&self, video: &[u8]) {
         let mut buf = self.frames.take_write();
         buf.clear();
         buf.extend_from_slice(video);
-        self.frames.publish(buf);
+        self.frames
+            .publish(buf, self.shared.cuts.load(Ordering::Relaxed));
         self.shared.published.fetch_add(1, Ordering::Relaxed);
         crate::latency::published();
     }
@@ -1046,6 +1110,16 @@ impl Worker {
     fn speed(&self) -> Speed {
         Speed::from_u8(self.shared.speed.load(Ordering::Relaxed))
     }
+}
+
+const NO_TOUCH: u32 = u32::MAX;
+
+fn pack_touch(at: Option<(u8, u8)>) -> u32 {
+    at.map_or(NO_TOUCH, |(x, y)| (x as u32) << 8 | y as u32)
+}
+
+fn unpack_touch(packed: u32) -> Option<(u8, u8)> {
+    (packed != NO_TOUCH).then_some(((packed >> 8) as u8, packed as u8))
 }
 
 fn flush_outbound(transport: &mut Option<Box<dyn LinkChannel>>, link: &Link) {
@@ -1126,36 +1200,6 @@ impl FrameCost {
     }
 }
 
-#[derive(Default)]
-struct RunAhead {
-    state: Vec<u8>,
-    video: Vec<u8>,
-    audio: Vec<i16>,
-    refused: bool,
-}
-
-impl RunAhead {
-    fn run(
-        &mut self,
-        core: &mut dyn RetroCore,
-        input: ButtonMask,
-        frames: u32,
-    ) -> Result<(), CoreError> {
-        core.set_frame_skip(true);
-        core.run_frame(input);
-        self.state = core.serialize()?;
-        for left in (0..frames).rev() {
-            let _ = core.take_audio();
-            core.set_frame_skip(left > 0);
-            core.run_frame(input);
-        }
-        self.audio = core.take_audio();
-        self.video.clear();
-        self.video.extend_from_slice(core.video_xrgb8888());
-        core.unserialize(&self.state)
-    }
-}
-
 struct TickRate {
     began: Instant,
     start_tick: u64,
@@ -1191,6 +1235,11 @@ impl TickRate {
     }
 }
 
+fn lock_scale(fixed: bool, rate: &mut TickRate, sent: Instant, tick: u64) -> Option<f64> {
+    let measured = rate.served(sent, tick);
+    (!fixed).then_some(measured).flatten()
+}
+
 fn drain_transport(transport: &mut dyn LinkChannel, link: &Link, cap: u32) {
     for _ in 0..cap {
         let Some(packet) = transport.try_recv() else {
@@ -1203,7 +1252,7 @@ fn drain_transport(transport: &mut dyn LinkChannel, link: &Link, cap: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slot_retro::{LoopbackLink, MockCore};
+    use slot_retro::LoopbackLink;
 
     const PANEL: Duration = Duration::from_micros(16_760);
 
@@ -1236,38 +1285,6 @@ mod tests {
             seeded: false,
         };
         assert_eq!(cost.span(ms(11.9), 6), 1);
-    }
-
-    #[test]
-    fn run_ahead_keeps_the_picture_and_sound_it_shows_and_puts_the_game_back() {
-        for frames in 1..=u32::from(RUN_AHEAD_MAX) {
-            let mut core = MockCore::new();
-            let mut runahead = RunAhead::default();
-            for real in 1..=3u64 {
-                runahead
-                    .run(&mut core, ButtonMask(0), frames)
-                    .expect("the mock always saves and loads");
-                let shown = real + u64::from(frames);
-                let mut reference = MockCore::new();
-                reference
-                    .unserialize(&(shown - 1).to_le_bytes())
-                    .expect("the reference refused its frame");
-                reference.run_frame(ButtonMask(0));
-                assert_eq!(
-                    core.serialize().expect("the mock always saves"),
-                    real.to_le_bytes(),
-                    "at {frames} the game is not back on frame {real}"
-                );
-                assert!(
-                    runahead.video == reference.video_xrgb8888(),
-                    "at {frames} the picture kept is not frame {shown}"
-                );
-                assert!(
-                    runahead.audio == reference.take_audio(),
-                    "at {frames} the sound kept is not frame {shown}'s alone"
-                );
-            }
-        }
     }
 
     fn ms(ms: f64) -> Duration {
@@ -1370,6 +1387,54 @@ mod tests {
         rate.restart(back, 370);
         let scale = run_window(&mut rate, back, 1);
         assert!(near_panel(scale), "measured {scale:?}");
+    }
+
+    #[test]
+    fn a_tick_keeps_the_time_the_loop_sent_it() {
+        let ring = Arc::new(crate::audio::Ring::new(4096));
+        let handle = EmuHandle::spawn(
+            Box::new(slot_retro::MockCore::new()),
+            "mock".into(),
+            ring,
+            None,
+            None,
+        );
+        let sent = Instant::now();
+        handle.tick(PRESENT);
+        std::thread::sleep(Duration::from_millis(40));
+        match handle
+            .shared
+            .next_tick(0, Instant::now() + Duration::from_millis(1))
+        {
+            Wait::Tick(_, at) => assert!(
+                at.duration_since(sent) < Duration::from_millis(10),
+                "the tick was stamped when the worker read it, {:?} after it was sent",
+                at.duration_since(sent)
+            ),
+            _ => panic!("no tick"),
+        }
+    }
+
+    #[test]
+    fn a_fixed_panel_period_is_never_remeasured_from_a_slow_loop() {
+        let start = Instant::now();
+        let slow = PANEL + Duration::from_millis(3);
+        let mut fixed = TickRate::new(start, 0);
+        let mut free = TickRate::new(start, 0);
+        let (mut from_fixed, mut from_free) = (None, None);
+        for t in 1..=u64::from(RATE_WINDOW) {
+            let at = start + slow * t as u32;
+            from_fixed = from_fixed.or(lock_scale(true, &mut fixed, at, t));
+            from_free = from_free.or(lock_scale(false, &mut free, at, t));
+        }
+        assert_eq!(
+            from_fixed, None,
+            "a fixed panel period was re-measured from a late loop"
+        );
+        assert!(
+            from_free.is_some_and(|s| s > 1.1),
+            "a free period was not measured: {from_free:?}"
+        );
     }
 
     #[test]

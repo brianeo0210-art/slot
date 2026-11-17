@@ -8,7 +8,7 @@ use slot::app::Phase;
 use slot::persist;
 use slot::session::Session;
 use slot_input::{Action, Btn, RawEvent};
-use slot_store::{Core, Platform, StateRing};
+use slot_store::{write_slot_state, Core, Platform, SlotState, StateRing};
 
 #[test]
 fn a_tap_resumes_and_a_hold_starts_clean() {
@@ -31,6 +31,33 @@ fn a_tap_resumes_and_a_hold_starts_clean() {
     hold.apply_at(Action::GbaDown(Btn::A), 0);
     hold.tick_ms(500);
     assert!(hold.starting_clean(), "holding A still resumed");
+}
+
+#[test]
+fn resume_on_insert_alone_decides_whether_a_tap_resumes() {
+    for (resume_insert, resume_power_on) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+        StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald")
+            .write_resume(&[7u8; 64])
+            .unwrap();
+        let s = SlotState {
+            clock_set: true,
+            resume_insert,
+            resume_power_on,
+            ..SlotState::default()
+        };
+        write_slot_state(d.path(), &s).unwrap();
+        let mut a = boot(d.path());
+        a.apply_at(Action::GbaDown(Btn::A), 0);
+        a.apply_at(Action::GbaUp(Btn::A), 120);
+        assert_eq!(
+            a.starting_clean(),
+            !resume_insert,
+            "resume_insert {resume_insert} resume_power_on {resume_power_on}"
+        );
+    }
 }
 
 #[test]
@@ -86,9 +113,10 @@ fn counter_after(root: &Path, hold: bool) -> u64 {
         s.update(1.0 / 60.0);
         std::thread::sleep(Duration::from_millis(1));
     }
-    s.app_mut().tick_ms(60_000);
+    s.app_mut().tick_ms(300_000);
     s.app_mut().settle_saves();
     let state = persist::read_resume(root, Platform::Gba, Core::Mgba, "Emerald")
+        .unwrap()
         .expect("nothing was flushed");
     u64::from_le_bytes(state.try_into().expect("the mock's state is 8 bytes"))
 }
@@ -127,7 +155,6 @@ fn a_game_left_running_starts_loading_before_the_first_frame() {
             cart: Some("Emerald".into()),
             cart_platform: Some(Platform::Gba),
             clock_set: true,
-            utc_offset_min: 0,
             ..Default::default()
         },
     )
@@ -152,4 +179,39 @@ fn an_empty_slot_loads_no_core_at_boot() {
     let s = Session::boot(d.path().to_path_buf());
     assert!(matches!(s.app().phase(), Phase::Shelf));
     assert!(!s.has_core(), "a core opened with nothing in the slot");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_save_the_card_cannot_read_is_never_replaced_with_a_blank_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let root = d.path();
+    common::clocked(root);
+    let sav = root.join("Saves/GBA/Emerald.sav");
+    std::fs::create_dir_all(sav.parent().unwrap()).unwrap();
+    std::fs::write(&sav, b"the player's real save").unwrap();
+    std::fs::set_permissions(&sav, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&sav).is_ok() {
+        return;
+    }
+
+    let mut s = Session::boot(root.to_path_buf());
+    s.feed([RawEvent::Down(Btn::A)], 16);
+    s.feed([RawEvent::Up(Btn::A)], 32);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(s.app().phase(), Phase::Playing { .. }) {
+        assert!(Instant::now() < deadline, "the cart never seated");
+        s.update(1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    s.app_mut().tick_ms(60_000);
+    s.app_mut().settle_saves();
+
+    std::fs::set_permissions(&sav, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        std::fs::read(&sav).unwrap(),
+        b"the player's real save",
+        "a save that failed to read was replaced by the blank one the game booted with"
+    );
 }

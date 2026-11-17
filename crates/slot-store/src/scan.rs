@@ -14,11 +14,12 @@ pub struct Cart {
     pub title: String,
     pub code: String,
     pub shell: Option<crate::ShellChoice>,
+    pub tags: Vec<String>,
 }
 
 impl Cart {
     pub fn read_header(&mut self) {
-        match self.platform {
+        match self.platform.hardware() {
             Platform::Gba => {
                 if let Some((title, code)) = header_title_code(&self.rom) {
                     self.title = title;
@@ -56,13 +57,21 @@ impl From<std::io::Error> for StoreError {
 }
 
 pub fn scan(root: &Path) -> Result<Vec<Cart>, StoreError> {
+    scan_of(root, &Platform::ALL)
+}
+
+pub fn scan_platform(root: &Path, platform: Platform) -> Result<Vec<Cart>, StoreError> {
+    scan_of(root, &[platform])
+}
+
+fn scan_of(root: &Path, platforms: &[Platform]) -> Result<Vec<Cart>, StoreError> {
     let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap_or_default();
     let shells = crate::cart_shell::layered(
         &read(crate::CART_SHELL_FILE),
         &read(crate::LABELS_SHELL_FILE),
     );
     let mut carts = Vec::new();
-    for platform in Platform::ALL {
+    for platform in platforms.iter().copied() {
         let dir = root.join("Games").join(platform.dir_name());
         let entries = match std::fs::read_dir(&dir) {
             Ok(d) => d,
@@ -94,6 +103,7 @@ pub fn scan(root: &Path) -> Result<Vec<Cart>, StoreError> {
                 title: String::new(),
                 code: String::new(),
                 shell: shells.get(&crate::cart_shell::key(stem)).copied(),
+                tags: Vec::new(),
                 label,
                 rom,
             });
@@ -102,7 +112,28 @@ pub fn scan(root: &Path) -> Result<Vec<Cart>, StoreError> {
     carts.sort_by(|a, b| {
         (a.platform as u8, sort_key(&a.stem)).cmp(&(b.platform as u8, sort_key(&b.stem)))
     });
+    tell_twins_apart(&mut carts);
     Ok(carts)
+}
+
+fn tell_twins_apart(carts: &mut [Cart]) {
+    let mut twins: HashMap<(Platform, String), Vec<usize>> = HashMap::new();
+    for (i, c) in carts.iter().enumerate() {
+        twins
+            .entry((c.platform, clean_label(&c.stem).to_lowercase()))
+            .or_default()
+            .push(i);
+    }
+    for group in twins.values().filter(|g| g.len() > 1) {
+        let all: Vec<Vec<String>> = group.iter().map(|&i| label_tags(&carts[i].stem)).collect();
+        for (&i, tags) in group.iter().zip(&all) {
+            carts[i].tags = tags
+                .iter()
+                .filter(|t| !all.iter().all(|other| other.contains(t)))
+                .cloned()
+                .collect();
+        }
+    }
 }
 
 pub fn listing(dir: &Path) -> HashMap<String, String> {
@@ -151,4 +182,62 @@ pub fn is_hidden(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with('.'))
+}
+
+pub fn clean_label(stem: &str) -> String {
+    let mut bare = String::with_capacity(stem.len());
+    let mut depth = 0u32;
+    for ch in stem.chars() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => bare.push(ch),
+            _ => {}
+        }
+    }
+
+    let mut out = String::with_capacity(bare.len());
+    for word in bare.split_whitespace().filter(|w| *w != "-") {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() {
+        stem.to_string()
+    } else {
+        out
+    }
+}
+
+pub fn label_tags(stem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0u32;
+    let mut cur = String::new();
+    for ch in stem.chars() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                if depth == 1 {
+                    cur.clear();
+                    continue;
+                }
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let t = cur.trim();
+                    if !t.is_empty() {
+                        out.push(t.to_string());
+                    }
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if depth >= 1 {
+            cur.push(ch);
+        }
+    }
+    out
 }

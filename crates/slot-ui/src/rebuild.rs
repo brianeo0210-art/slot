@@ -1,4 +1,4 @@
-use slot_gfx::{Canvas, Draw, TexId, OUT_H, OUT_W};
+use slot_gfx::{Canvas, Draw, TexId, OUT_W};
 
 use crate::hud::{FILL, HUD_INK, TRACK};
 use crate::plate::UndoFace;
@@ -8,6 +8,8 @@ const BAR_W: f32 = 440.0;
 const BAR_H: f32 = 10.0;
 const TITLE_PX: f32 = 40.0;
 const TITLE_H: u32 = 52;
+const HEADLINE_PX: f32 = 35.0;
+const HEADLINE_H: u32 = 46;
 const COUNT_PX: f32 = 26.0;
 const COUNT_H: u32 = 36;
 const TITLE_GAP: f32 = 30.0;
@@ -15,6 +17,10 @@ const COUNT_GAP: f32 = 24.0;
 
 pub fn rebuild_title_face(text: &str) -> UndoFace {
     line_face(text, TITLE_PX, TITLE_H)
+}
+
+pub fn headline_face(text: &str) -> UndoFace {
+    line_face(text, HEADLINE_PX, HEADLINE_H)
 }
 
 pub fn rebuild_count_face(text: &str) -> UndoFace {
@@ -74,7 +80,7 @@ impl RebuildScreen {
             x: 0.0,
             y: 0.0,
             w: canvas.w,
-            h: OUT_H as f32,
+            h: canvas.h,
             colour: [0.0, 0.0, 0.0, 1.0],
         });
         let height = |line: Option<(TexId, u32, u32)>, gap: f32| {
@@ -82,7 +88,7 @@ impl RebuildScreen {
         };
         let stack = height(self.title, TITLE_GAP) + BAR_H + height(self.count, COUNT_GAP);
         let x = canvas.centred(BAR_W);
-        let y = OUT_H as f32 / 2.0 - stack / 2.0 + height(self.title, TITLE_GAP);
+        let y = canvas.h / 2.0 - stack / 2.0 + height(self.title, TITLE_GAP);
         let centred = |(tex, w, h): (TexId, u32, u32), top: f32| Draw::Tex {
             x: canvas.centred(w as f32),
             y: top,

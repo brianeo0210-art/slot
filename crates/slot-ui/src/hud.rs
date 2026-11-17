@@ -1,8 +1,8 @@
-use slot_gfx::{Canvas, Draw, TexId, OUT_H};
-use slot_store::{BLUE_LIGHT_MAX, BRIGHTNESS_MAX, VOLUME_MAX};
+use slot_gfx::{Canvas, Draw, TexId};
+use slot_store::{BLUE_LIGHT_MAX, BRIGHTNESS_MAX, DIM_MAX, SUNLIGHT_MAX, VOLUME_MAX};
 
 use crate::icon::icon_box;
-use crate::toast::toast_rect;
+use crate::toast::{toast_band, toast_lines, toast_rect, toast_rect_lines};
 use crate::{Badge, Icon, Toast};
 
 pub type Millis = u64;
@@ -56,6 +56,7 @@ pub enum HudKind {
     BlueLight,
     Volume,
     Rewind,
+    Sunlight,
 }
 
 impl HudKind {
@@ -69,15 +70,17 @@ impl HudKind {
             HudKind::Volume if value == 0 => Icon::VolumeZero,
             HudKind::Volume => Icon::Volume,
             HudKind::Rewind => Icon::Rewind,
+            HudKind::Sunlight => Icon::Sunlight,
         }
     }
 
     fn max(self) -> u8 {
         match self {
-            HudKind::Brightness => BRIGHTNESS_MAX,
+            HudKind::Brightness => BRIGHTNESS_MAX + DIM_MAX,
             HudKind::BlueLight => BLUE_LIGHT_MAX,
             HudKind::Volume => VOLUME_MAX,
             HudKind::Rewind => 100,
+            HudKind::Sunlight => SUNLIGHT_MAX,
         }
     }
 }
@@ -150,7 +153,9 @@ pub struct Hud {
     headphones: bool,
     ff: FfState,
     said: Option<(Toast, Millis)>,
+    said_lines: usize,
     alarm: Option<Millis>,
+    alarm_toast: Option<Toast>,
     icons: Vec<TexId>,
     toasts: Vec<TexId>,
     link: LinkBadge,
@@ -170,8 +175,21 @@ impl Hud {
         self.toasts = toasts;
     }
 
+    pub fn toast_tex(&self, toast: Toast) -> Option<TexId> {
+        self.toasts.get(toast.index()).copied()
+    }
+
     pub fn toast(&mut self, toast: Toast, now: Millis) {
+        self.toast_saying(toast, &toast.text(), now);
+    }
+
+    pub fn toast_saying(&mut self, toast: Toast, said: &str, now: Millis) {
         self.said = Some((toast, now));
+        self.said_lines = toast_lines(toast, said);
+    }
+
+    pub fn hush(&mut self) {
+        self.said = None;
     }
 
     pub fn set_alarm(&mut self, on: bool, now: Millis) {
@@ -180,6 +198,15 @@ impl Hud {
             (true, None) => Some(now),
             (false, _) => None,
         };
+    }
+
+    pub fn set_alarm_toast(&mut self, toast: Toast) {
+        self.alarm_toast = Some(toast);
+    }
+
+    pub fn alarm_toast(&self) -> Option<Toast> {
+        self.alarm
+            .map(|_| self.alarm_toast.unwrap_or(Toast::CardUnwritable))
     }
 
     pub fn alarmed(&self) -> bool {
@@ -251,7 +278,10 @@ impl Hud {
                 x: 0.0,
                 y: 0.0,
                 w: canvas.w,
-                h: PLATE_H,
+                h: match toast > 0.0 {
+                    true => toast_band(self.said_lines),
+                    false => PLATE_H,
+                },
                 colour: faded(PLATE, alpha.max(toast)),
             });
             if toast > 0.0 {
@@ -319,12 +349,12 @@ impl Hud {
     fn draw_alarm(&self, canvas: Canvas, age: Millis, out: &mut Vec<Draw>) {
         out.push(Draw::Rect {
             x: 0.0,
-            y: (OUT_H as f32 - ALARM_BAND_H) / 2.0,
+            y: (canvas.h - ALARM_BAND_H) / 2.0,
             w: canvas.w,
             h: ALARM_BAND_H,
             colour: pulse(age),
         });
-        let alarm = Toast::CardUnwritable;
+        let alarm = self.alarm_toast.unwrap_or(Toast::CardUnwritable);
         let Some(tex) = self.toasts.get(alarm.index()).copied() else {
             return;
         };
@@ -354,7 +384,7 @@ impl Hud {
         let Some((said, _)) = self.said else {
             return;
         };
-        let (x, y, w, h) = toast_rect(canvas, said);
+        let (x, y, w, h) = toast_rect_lines(canvas, said, self.said_lines);
         out.push(Draw::Tex {
             x,
             y,
@@ -389,18 +419,22 @@ impl Hud {
 
     fn toast_alpha(&self, now: Millis) -> f32 {
         match self.said {
-            Some((_, shown)) => fade(shown, now),
+            Some((toast, shown)) => fade_over(shown, now, toast.hold_ms()),
             None => 0.0,
         }
     }
 }
 
 fn fade(shown: Millis, now: Millis) -> f32 {
+    fade_over(shown, now, HUD_MS)
+}
+
+fn fade_over(shown: Millis, now: Millis, hold: Millis) -> f32 {
     let age = now.saturating_sub(shown);
-    if age >= HUD_MS {
+    if age >= hold {
         return 0.0;
     }
-    ((HUD_MS - age) as f32 / FADE_MS as f32).min(1.0)
+    ((hold - age) as f32 / FADE_MS as f32).min(1.0)
 }
 
 fn pulse(age: Millis) -> [f32; 4] {

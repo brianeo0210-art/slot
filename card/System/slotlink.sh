@@ -6,19 +6,27 @@ RUN="${AGS_RUN:-/run}"
 
 LINK_SSID="${AGS_LINK_SSID:-slotlink}"
 LINK_PSK="${AGS_LINK_PSK:-slotlink0}"
-LINK_FREQ="${AGS_LINK_FREQ:-5745}"
+LINK_FREQS="${AGS_LINK_FREQS:-5180 5200 5220 5240 5745 5765 5785 5805 5825}"
 LINK_HOST_IP="${AGS_LINK_HOST_IP:-10.42.0.1/24}"
 LINK_PEER_IP="${AGS_LINK_PEER_IP:-10.42.0.2/24}"
 LINK_WAIT_S="${AGS_LINK_WAIT_S:-10}"
 LINK_PIN_WAIT_S="${AGS_LINK_PIN_WAIT_S:-20}"
 LINK_RESCAN="${AGS_LINK_RESCAN:-2}"
+BT_SYS="${AGS_BT_SYS:-$NET/../bluetooth}"
+BT_PID="$RUN/slotbt.pid"
 LINK_AP_GLOBAL="${AGS_LINK_AP_GLOBAL:-}"
 LINK_TRACE="${AGS_LINK_TRACE:-}"
 LINK_MARK="$RUN/slotlink.session"
+WIFI_MARK="$RUN/slotwifi.on"
 
 WPA_SUPPLICANT="${AGS_WPA_SUPPLICANT:-wpa_supplicant}"
 WPA_CLI="${AGS_WPA_CLI:-wpa_cli}"
 IP="${AGS_IP:-ip}"
+RFKILL="${AGS_RFKILL:-rfkill}"
+UDHCPC="${AGS_UDHCPC:-udhcpc}"
+RTK_HCIATTACH="${AGS_RTK_HCIATTACH:-rtk_hciattach}"
+HCICONFIG="${AGS_HCICONFIG:-hciconfig}"
+RANDOM_SRC="${AGS_RANDOM_SRC:-/proc/sys/kernel/random/uuid}"
 UPTIME="${AGS_UPTIME:-/proc/uptime}"
 CTRL_DIR="${AGS_CTRL_DIR:-/var/run/wpa_supplicant}"
 
@@ -26,6 +34,27 @@ trace() {
 	[ -n "$LINK_TRACE" ] || return 0
 	echo "slotlink: $(cut -d' ' -f1 "$UPTIME" 2>/dev/null) $*" >> "$LINK_TRACE" 2>/dev/null
 	return 0
+}
+
+LINK_TRACE_KEEP="${AGS_LINK_TRACE_KEEP:-5}"
+
+trace_attempt() {
+	[ -n "$LINK_TRACE" ] || return 0
+	if [ -f "$LINK_TRACE" ]; then
+		from=$(grep -n -E ' (host|join): asked' "$LINK_TRACE" 2>/dev/null \
+			| tail -n $((LINK_TRACE_KEEP - 1)) | head -n 1 | cut -d: -f1)
+		if [ "$LINK_TRACE_KEEP" -le 1 ]; then
+			: > "$LINK_TRACE" 2>/dev/null
+		elif [ -n "$from" ]; then
+			sed -n "$from,\$p" "$LINK_TRACE" > "$LINK_TRACE.tmp" 2>/dev/null \
+				&& /bin/mv -f "$LINK_TRACE.tmp" "$LINK_TRACE"
+		fi
+	fi
+	trace "$1 at $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+}
+
+interfaces() {
+	ls "$NET" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
 }
 
 wait_dev() {
@@ -40,7 +69,7 @@ wait_dev() {
 wifi_up() {
 	wait_dev wlan0 40 || return 0
 	trace "wlan0 present"
-	rfkill unblock wifi 2>/dev/null || true
+	$RFKILL unblock wifi 2>/dev/null || true
 	$IP link set wlan0 up 2>/dev/null || true
 }
 
@@ -61,7 +90,8 @@ supplicant_stop() {
 link_clear() {
 	supplicant_stop "$RUN/wpa_ap" wlan1
 	$IP addr flush dev wlan1 2>/dev/null || true
-	/bin/rm -f "$RUN/slotlink-ap.conf"
+	/bin/rm -f "$RUN/slotlink-ap.conf" "$RUN/slotlink.ap"
+	wifi_stop
 	if [ -f "$RUN/slotlink-sta.conf" ]; then
 		supplicant_stop "$CTRL_DIR" wlan0
 		$IP addr flush dev wlan0 2>/dev/null || true
@@ -93,13 +123,45 @@ link_wait() {
 	done
 }
 
+pick_freq() {
+	count=0
+	for f in $LINK_FREQS; do
+		count=$((count + 1))
+	done
+	seed=$(cat "$RANDOM_SRC" 2>/dev/null | tr -dc '0-9' | cut -c1-6)
+	[ -n "$seed" ] || seed="$$$(cut -d' ' -f1 "$UPTIME" 2>/dev/null | tr -dc '0-9')"
+	want=$(($(echo "1$seed" | cut -c1-9) % count))
+	i=0
+	for f in $LINK_FREQS; do
+		if [ "$i" -eq "$want" ]; then
+			echo "$f"
+			return 0
+		fi
+		i=$((i + 1))
+	done
+}
+
 link_host() {
 	echo "$$" > "$LINK_MARK"
-	trace "host: asked"
+	trace_attempt "host: asked"
 	link_clear
 	wifi_up
-	wait_dev wlan1 4 || return 1
-	command -v "$WPA_SUPPLICANT" >/dev/null 2>&1 || return 1
+	wait_dev wlan1 4 || {
+		trace "host: no wlan1, interfaces: $(interfaces)"
+		return 1
+	}
+	command -v "$WPA_SUPPLICANT" >/dev/null 2>&1 || {
+		trace "host: no wpa_supplicant"
+		return 1
+	}
+
+	freq=$(pick_freq)
+	bssid=$(cat "$NET/wlan1/address" 2>/dev/null)
+	[ -n "$bssid" ] || {
+		trace "host: no wlan1 address"
+		return 1
+	}
+	trace "host: channel $freq"
 
 	/bin/mkdir -p "$RUN/wpa_ap"
 	{
@@ -111,7 +173,7 @@ link_host() {
 		echo 'network={'
 		echo "	ssid=\"$LINK_SSID\""
 		echo '	mode=2'
-		echo "	frequency=$LINK_FREQ"
+		echo "	frequency=$freq"
 		echo '	key_mgmt=WPA-PSK'
 		echo '	proto=RSN'
 		echo '	pairwise=CCMP'
@@ -121,9 +183,18 @@ link_host() {
 	/bin/chmod 600 "$RUN/slotlink-ap.conf"
 
 	$IP link set wlan1 up 2>/dev/null || true
-	$WPA_SUPPLICANT -B -i wlan1 -c "$RUN/slotlink-ap.conf" -Dnl80211 >/dev/null 2>&1 || return 1
-	link_wait "$RUN/wpa_ap" wlan1 "$LINK_WAIT_S" 0 "" || return 1
+	if ! $WPA_SUPPLICANT -B -i wlan1 -c "$RUN/slotlink-ap.conf" -Dnl80211 >"$RUN/slotlink-sup.err" 2>&1; then
+		trace "host: wpa_supplicant failed: $(tr '\n' ' ' < "$RUN/slotlink-sup.err" | sed 's/ $//')"
+		/bin/rm -f "$RUN/slotlink-sup.err"
+		return 1
+	fi
+	/bin/rm -f "$RUN/slotlink-sup.err"
+	link_wait "$RUN/wpa_ap" wlan1 "$LINK_WAIT_S" 0 "" || {
+		trace "host: wlan1 never came up in ${LINK_WAIT_S}s"
+		return 1
+	}
 	$IP addr add "$LINK_HOST_IP" dev wlan1 2>/dev/null || true
+	echo "$freq $bssid" > "$RUN/slotlink.ap"
 	trace "host: addressed"
 }
 
@@ -134,46 +205,39 @@ link_sta_conf() {
 		echo "	ssid=\"$LINK_SSID\""
 		echo '	key_mgmt=WPA-PSK'
 		echo "	psk=\"$LINK_PSK\""
-		if [ -n "${1:-}" ]; then
-			echo "	scan_freq=$1"
-			echo "	freq_list=$1"
-		fi
+		echo "	bssid=$2"
+		echo "	scan_freq=$1"
+		echo "	freq_list=$1"
 		echo '}'
 	} > "$RUN/slotlink-sta.conf"
 	/bin/chmod 600 "$RUN/slotlink-sta.conf"
 }
 
 link_join() {
+	freq="${1:-}"
+	bssid="${2:-}"
+	[ -n "$freq" ] && [ -n "$bssid" ] || return 2
 	echo "$$" > "$LINK_MARK"
-	trace "join: asked"
+	trace_attempt "join: asked"
 	link_clear
 	wifi_up
-	[ -d "$NET/wlan0" ] || return 1
+	[ -d "$NET/wlan0" ] || {
+		trace "join: no wlan0, interfaces: $(interfaces)"
+		return 1
+	}
 	/bin/mkdir -p "$CTRL_DIR"
 	$IP link set wlan0 up 2>/dev/null || true
 
-	tries="${AGS_LINK_TRIES:-2}"
-	attempt=1
-	while [ "$attempt" -le "$tries" ]; do
-		if [ "$attempt" -eq 1 ]; then
-			freq="$LINK_FREQ"
-			bound="$LINK_PIN_WAIT_S"
-		else
-			freq=
-			bound="$LINK_WAIT_S"
-		fi
-		link_sta_conf "$freq"
-		supplicant_stop "$CTRL_DIR" wlan0
-		$WPA_SUPPLICANT -B -i wlan0 -c "$RUN/slotlink-sta.conf" -Dnl80211 >/dev/null 2>&1 \
-			|| { attempt=$((attempt + 1)); continue; }
-		trace "join: attempt $attempt on ${freq:-every channel}"
-		if link_wait "$CTRL_DIR" wlan0 "$bound" "$LINK_RESCAN" "$freq"; then
+	link_sta_conf "$freq" "$bssid"
+	supplicant_stop "$CTRL_DIR" wlan0
+	if $WPA_SUPPLICANT -B -i wlan0 -c "$RUN/slotlink-sta.conf" -Dnl80211 >/dev/null 2>&1; then
+		trace "join: attempt on $freq $bssid"
+		if link_wait "$CTRL_DIR" wlan0 "$LINK_PIN_WAIT_S" "$LINK_RESCAN" "$freq"; then
 			$IP addr add "$LINK_PEER_IP" dev wlan0 2>/dev/null || true
 			trace "join: addressed"
 			return 0
 		fi
-		attempt=$((attempt + 1))
-	done
+	fi
 	trace "join: no host found"
 	return 3
 }
@@ -194,14 +258,80 @@ link_warm() {
 	wait_dev wlan1 4
 }
 
+wifi_start() {
+	[ -f "${1:-}" ] || return 3
+	wifi_up
+	[ -d "$NET/wlan0" ] || return 3
+	/bin/mkdir -p "$CTRL_DIR"
+	supplicant_stop "$CTRL_DIR" wlan0
+	: > "$WIFI_MARK"
+	$WPA_SUPPLICANT -B -i wlan0 -c "$1" -Dnl80211 >/dev/null 2>&1 || return 3
+	n=0
+	while [ "$n" -lt 20 ]; do
+		$WPA_CLI -p "$CTRL_DIR" -i wlan0 ping 2>/dev/null | grep -q PONG && return 0
+		sleep 0.25 2>/dev/null || sleep 1
+		n=$((n + 1))
+	done
+	return 3
+}
+
+wifi_stop() {
+	if [ -f "$RUN/udhcpc.wlan0.pid" ]; then
+		kill "$(cat "$RUN/udhcpc.wlan0.pid")" 2>/dev/null || true
+		/bin/rm -f "$RUN/udhcpc.wlan0.pid"
+	fi
+	[ -f "$WIFI_MARK" ] || return 0
+	supplicant_stop "$CTRL_DIR" wlan0
+	$IP addr flush dev wlan0 2>/dev/null || true
+	/bin/rm -f "$WIFI_MARK"
+	return 0
+}
+
+wifi_off() {
+	wifi_stop
+	$IP link set wlan0 down 2>/dev/null || true
+	$RFKILL block wifi 2>/dev/null || true
+	return 0
+}
+
+bt_up() {
+	$RFKILL unblock bluetooth 2>/dev/null || true
+	if ! { [ -f "$BT_PID" ] && kill -0 "$(cat "$BT_PID")" 2>/dev/null; }; then
+		$RTK_HCIATTACH -n -s 115200 ttyS1 rtk_h5 >/dev/null 2>&1 &
+		echo "$!" > "$BT_PID"
+	fi
+	n=0
+	while [ ! -e "$BT_SYS/hci0" ] && [ "$n" -lt 20 ]; do
+		sleep 0.25 2>/dev/null || sleep 1
+		n=$((n + 1))
+	done
+	[ -e "$BT_SYS/hci0" ] || return 1
+	$HCICONFIG hci0 up >/dev/null 2>&1
+}
+
+bt_down() {
+	$HCICONFIG hci0 down >/dev/null 2>&1 || true
+	if [ -f "$BT_PID" ]; then
+		kill "$(cat "$BT_PID")" 2>/dev/null || true
+		/bin/rm -f "$BT_PID"
+	fi
+	$RFKILL block bluetooth 2>/dev/null || true
+	return 0
+}
+
 case "${1:-} ${2:-}" in
+"wifi start") wifi_start "${3:-}" ;;
+"wifi stop") wifi_stop ;;
+"wifi off") wifi_off ;;
 "link host") link_host ;;
-"link join") link_join ;;
+"link join") link_join "${3:-}" "${4:-}" ;;
+"bt up") bt_up ;;
+"bt down") bt_down ;;
 "link down") link_down ;;
 "link warm") link_warm ;;
 "link cool") exit 0 ;;
 *)
-	echo "usage: slotlink.sh link [host|join|down|warm|cool]" >&2
+	echo "usage: slotlink.sh link [host|join FREQ BSSID|down|warm|cool] | bt [up|down] | wifi [start CONF|stop|off]" >&2
 	exit 2
 	;;
 esac

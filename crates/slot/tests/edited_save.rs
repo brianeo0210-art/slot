@@ -24,6 +24,10 @@ fn start(root: &Path, sav: Option<&[u8]>, clean: bool) -> persist::Start {
     )
 }
 
+fn resume_of(s: &persist::Start) -> Option<Vec<u8>> {
+    s.resume.as_ref().unwrap().clone()
+}
+
 fn refused(root: &Path) -> Vec<String> {
     let dir = root.join("States/GBA/mgba/Emerald");
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -42,7 +46,7 @@ fn the_first_time_a_save_is_seen_it_is_not_an_edit() {
         .unwrap();
     let got = start(d.path(), Some(&[1u8; 32]), false);
     assert!(!got.edited_elsewhere);
-    assert_eq!(got.resume, Some(vec![7u8; 64]));
+    assert_eq!(resume_of(&got), Some(vec![7u8; 64]));
     assert!(refused(d.path()).is_empty());
 }
 
@@ -55,7 +59,7 @@ fn an_unchanged_save_keeps_the_resume() {
     start(d.path(), Some(&[1u8; 32]), false);
     let again = start(d.path(), Some(&[1u8; 32]), false);
     assert!(!again.edited_elsewhere);
-    assert_eq!(again.resume, Some(vec![7u8; 64]));
+    assert_eq!(resume_of(&again), Some(vec![7u8; 64]));
 }
 
 #[test]
@@ -68,7 +72,11 @@ fn a_save_changed_outside_sets_the_resume_aside_and_starts_fresh() {
     let got = start(d.path(), Some(&[2u8; 32]), false);
 
     assert!(got.edited_elsewhere);
-    assert_eq!(got.resume, None, "the old snapshot would undo the edit");
+    assert_eq!(
+        resume_of(&got),
+        None,
+        "the old snapshot would undo the edit"
+    );
     assert_eq!(ring.read_resume().unwrap(), None);
     assert_eq!(
         refused(d.path()),
@@ -93,7 +101,11 @@ fn an_edit_is_noticed_once_and_not_on_every_start() {
     ring.write_resume(&[8u8; 64]).unwrap();
     let after = start(d.path(), Some(&[2u8; 32]), false);
     assert!(!after.edited_elsewhere);
-    assert_eq!(after.resume, Some(vec![8u8; 64]), "a new snapshot was lost");
+    assert_eq!(
+        resume_of(&after),
+        Some(vec![8u8; 64]),
+        "a new snapshot was lost"
+    );
 }
 
 #[test]
@@ -104,7 +116,7 @@ fn a_hold_start_still_sets_aside_a_snapshot_the_edit_made_stale() {
     start(d.path(), Some(&[1u8; 32]), true);
     let got = start(d.path(), Some(&[2u8; 32]), true);
     assert!(got.edited_elsewhere);
-    assert_eq!(got.resume, None);
+    assert_eq!(resume_of(&got), None);
     assert_eq!(ring.read_resume().unwrap(), None);
     assert_eq!(refused(d.path()).len(), 1);
 }
@@ -115,7 +127,7 @@ fn a_hold_start_without_an_edit_leaves_the_resume_on_disk() {
     let ring = StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald");
     ring.write_resume(&[7u8; 64]).unwrap();
     let got = start(d.path(), Some(&[1u8; 32]), true);
-    assert_eq!(got.resume, None);
+    assert_eq!(resume_of(&got), None);
     assert_eq!(ring.read_resume().unwrap(), Some(vec![7u8; 64]));
 }
 
@@ -127,7 +139,7 @@ fn a_cart_with_no_save_is_never_an_edit() {
         .unwrap();
     let got = start(d.path(), None, false);
     assert!(!got.edited_elsewhere);
-    assert_eq!(got.resume, Some(vec![7u8; 64]));
+    assert_eq!(resume_of(&got), Some(vec![7u8; 64]));
 }
 
 #[test]
@@ -143,11 +155,13 @@ fn what_slot_writes_itself_is_never_taken_for_an_edit() {
         Some(&[5u8; 32]),
     )
     .unwrap();
-    let sav = persist::read_sav(d.path(), Platform::Gba, "Emerald").unwrap();
+    let sav = persist::read_sav(d.path(), Platform::Gba, "Emerald")
+        .unwrap()
+        .unwrap();
     assert_eq!(sav, vec![5u8; 32]);
     let got = start(d.path(), Some(&sav), false);
     assert!(!got.edited_elsewhere, "slot flagged its own save");
-    assert_eq!(got.resume, Some(vec![7u8; 64]));
+    assert_eq!(resume_of(&got), Some(vec![7u8; 64]));
 }
 
 #[test]
@@ -166,14 +180,18 @@ fn an_srm_edited_outside_is_noticed_when_there_is_no_sav() {
     std::fs::write(&srm, [1u8; 32]).unwrap();
     let ring = StateRing::new(d.path(), Platform::Gba, Core::Mgba, "Emerald");
     ring.write_resume(&[7u8; 64]).unwrap();
-    let sav = persist::read_sav(d.path(), Platform::Gba, "Emerald").unwrap();
+    let sav = persist::read_sav(d.path(), Platform::Gba, "Emerald")
+        .unwrap()
+        .unwrap();
     start(d.path(), Some(&sav), false);
 
     std::fs::write(&srm, [2u8; 32]).unwrap();
-    let sav = persist::read_sav(d.path(), Platform::Gba, "Emerald").unwrap();
+    let sav = persist::read_sav(d.path(), Platform::Gba, "Emerald")
+        .unwrap()
+        .unwrap();
     let got = start(d.path(), Some(&sav), false);
     assert!(got.edited_elsewhere);
-    assert_eq!(got.resume, None);
+    assert_eq!(resume_of(&got), None);
 }
 
 fn counter_after_start(root: &Path) -> u64 {
@@ -187,9 +205,10 @@ fn counter_after_start(root: &Path) -> u64 {
         s.update(1.0 / 60.0);
         std::thread::sleep(Duration::from_millis(1));
     }
-    s.app_mut().tick_ms(60_000);
+    s.app_mut().tick_ms(300_000);
     s.app_mut().settle_saves();
     let state = persist::read_resume(root, Platform::Gba, Core::Mgba, "Emerald")
+        .unwrap()
         .expect("nothing was flushed");
     u64::from_le_bytes(state.try_into().expect("the mock's state is 8 bytes"))
 }

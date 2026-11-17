@@ -1,12 +1,6 @@
 <div align="center">
 
-<img src=".github/resources/banner.png" width="100%" alt="slot. A bespoke, Game Boy-centric frontend for the Anbernic RG SP.">
-
-<a href="LICENSE"><img src="https://img.shields.io/github/license/BrandonKowalski/slot?style=for-the-badge&labelColor=242429&color=4d4d57" height="36" alt="License"></a>
-<a href="https://github.com/BrandonKowalski/slot/stargazers"><img src="https://img.shields.io/github/stars/BrandonKowalski/slot?style=for-the-badge&labelColor=242429&color=4d4d57" height="36" alt="Stars"></a>
-<a href="https://github.com/BrandonKowalski/slot/releases"><img src="https://img.shields.io/github/downloads/BrandonKowalski/slot/total?style=for-the-badge&labelColor=242429&color=4d4d57" height="36" alt="Downloads"></a>
-<a href="https://slot-cfw.fyi"><img src="https://img.shields.io/badge/Guide-slot--cfw.fyi-4d4d57?style=for-the-badge&labelColor=242429" height="36" alt="Guide"></a>
-<a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Changelog-4d4d57?style=for-the-badge&labelColor=242429" height="36" alt="Changelog"></a>
+<img align="top" src=".github/resources/hero.webp" width="100%" alt="slot. A bespoke, Game Boy-centric frontend for the Anbernic RG SP."><br><a href="https://github.com/slot-cfw/slot/releases/latest"><img align="top" src="https://badges.slot-cfw.fyi/release.svg" width="20.7142%" alt="Download"></a><a href="https://slot-cfw.fyi"><img align="top" src=".github/resources/badges/guide.svg" width="19.5238%" alt="Guide"></a><a href="https://discord.gg/NYRWsSuPUu"><img align="top" src=".github/resources/badges/discord.svg" width="19.5238%" alt="Discord"></a><a href="https://github.com/slot-cfw/slot/stargazers"><img align="top" src="https://badges.slot-cfw.fyi/stars.svg" width="19.5238%" alt="Stars"></a><a href="https://github.com/slot-cfw/slot/releases"><img align="top" src="https://badges.slot-cfw.fyi/downloads.svg" width="20.7142%" alt="Downloads"></a>
 
 </div>
 
@@ -17,13 +11,6 @@
 A bespoke, Game Boy-centric frontend for the Anbernic RG SP.
 
 Has support for GBA, GBC, and GB titles only.
-
-> [!IMPORTANT]
-> ROMs must be unzipped. slot does not read `.zip` or `.7z` files.
-
-A full user guide can be found at [slot-cfw.fyi](https://slot-cfw.fyi).
-
-Release notes can be found in the [changelog](CHANGELOG.md).
 
 ---
 
@@ -42,18 +29,21 @@ Release notes can be found in the [changelog](CHANGELOG.md).
 
 # Supported Devices
 
-| Device             | Supported                  | Since Version |
-|--------------------|----------------------------|---------------|
-| Anbernic RG SP     | Yes                        | Always        |
-| Anbernic RG34XX    | Yes                        | 1.4.0         |
-| Anbernic RG34XXSP  | Yes (No Stick Support Yet) | 1.4.0         |
-| Anbernic RG35XXSP  | Yes                        | 1.5.0         |
-| Anbernic 35XX Plus | Yes                        | 1.5.0         |
-| Anbernic RG28XX    | Yes                        | 1.6.0         |
-| Anbernic RG35XX-H  | Yes                        | 1.7.0         |
+| Device                | Since Version |
+|-----------------------|---------------|
+| Anbernic RG SP        | Always        |
+| Anbernic RG 34XX      | 1.4.0         |
+| Anbernic RG 34XXSP    | 1.4.0         |
 
-If you have one of the untested devices, or have tried slot on a device not listed,
-please [open an issue on GitHub](https://github.com/BrandonKowalski/slot/issues) and let me know how it went.
+## Devices I never wanted to support that slot works on
+
+| Device                | Since Version |
+|-----------------------|---------------|
+| Anbernic RG 35XXSP    | 1.5.0         |
+| Anbernic RG 35XX Plus | 1.5.0         |
+| Anbernic RG 35XX-H    | 1.7.0         |
+| Anbernic RG 35XX Pro  | 1.15.0        |
+| Anbernic RG 28XX      | 1.6.0         |
 
 ---
 
@@ -66,7 +56,7 @@ My goal with this project was to recreate the feeling of playing my GBA SP in th
 but with a few modern creature comforts.
 
 Nothing about this project is exciting or groundbreaking from a technological perspective, and as a
-result, I delegated the glue code. mGBA and gpSP have been around forever and are the true stars of
+result, I delegated the glue code. mGBA, gpSP and Gambatte have been around forever and are the true stars of
 this show. The incredible skeuomorphic art is the work of [Markus](https://github.com/MarkusMaribu), an
 artist who saw the bare-bones version and offered to dress it up.
 
@@ -74,3 +64,11 @@ I understand if my use of AI is a dealbreaker for you. Just know it's the least 
 what's here.
 
 Figured I should share the end result of all the wasted water. ✌🏻
+
+---
+
+# Spread Joy!
+
+I've spent a lot of time building slot.
+
+If you enjoy using it and feel inclined to pay it forward, go do something nice for someone! ❤️

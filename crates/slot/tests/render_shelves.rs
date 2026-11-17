@@ -74,7 +74,7 @@ fn hud_ink(px: &[u8]) -> usize {
 fn name_window() -> (usize, usize, usize, usize) {
     (
         OUT_W as usize / 2 - 70,
-        slot_name_y() as usize,
+        slot_name_y(slot_ui::Canvas::FRAMED) as usize,
         140,
         HINT_H as usize,
     )
@@ -142,6 +142,26 @@ fn put_game_boy_carts(root: &Path) {
     }
 }
 
+fn put_labels(root: &Path) {
+    for (dir, stem, rgb) in [
+        ("GBA", "Emerald", [40u8, 160, 90]),
+        ("GBA", "Fusion", [150, 60, 170]),
+        ("GB", "Tetris Rosy Retrospection", [210, 120, 40]),
+        ("GBC", "Tetris Chromatic", [40, 110, 210]),
+    ] {
+        let path = root.join(format!("Labels/{dir}/{stem}.png"));
+        std::fs::create_dir_all(path.parent().expect("a labels folder")).expect("make Labels");
+        let file = std::fs::File::create(&path).expect("create label");
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), 640, 330);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header()
+            .expect("label header")
+            .write_image_data(&rgb.repeat(640 * 330))
+            .expect("label data");
+    }
+}
+
 fn gb_rom(cgb: u8) -> Vec<u8> {
     let mut rom = vec![0u8; 0x8000];
     rom[0x143] = cgb;
@@ -151,7 +171,7 @@ fn gb_rom(cgb: u8) -> Vec<u8> {
 fn on_the_lone_pak(down: u32) -> (usize, usize) {
     (
         (OUT_W / 2) as usize,
-        (rest_y(GB_CART_H as f32) + down as f32) as usize,
+        (rest_y(slot_ui::Canvas::FRAMED, GB_CART_H as f32) + down as f32) as usize,
     )
 }
 
@@ -177,6 +197,7 @@ fn the_shoulders_ring_over_a_shelf_for_each_system() {
     };
     let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
     put_game_boy_carts(d.path());
+    put_labels(d.path());
     clocked(d.path());
     let mut f = Frontend::boot(Box::new(SimPlatform::at(d.path().to_path_buf())));
     f.upload_faces(&mut c);
@@ -221,8 +242,8 @@ fn the_shoulders_ring_over_a_shelf_for_each_system() {
     let mut seen = Vec::new();
     let mut marks = vec![name_pixels(&gba)];
     for (name, banner, _platform) in [
-        ("game-boy", "Game Boy", CartPlatform::Gb),
         ("game-boy-color", "Game Boy Color", CartPlatform::Gbc),
+        ("game-boy", "Game Boy", CartPlatform::Gb),
     ] {
         tap(&mut f, &mut input, Btn::R1);
         let_the_name_in(&mut f, &mut c, &mut input);
@@ -287,6 +308,77 @@ fn the_shoulders_ring_over_a_shelf_for_each_system() {
         name_ink(&later),
         0,
         "the shelf's name was still in the slot after it should have faded"
+    );
+}
+
+fn solid_wallpaper(root: &Path, name: &str, rgb: [u8; 3]) {
+    let dir = root.join("Wallpapers");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = std::fs::File::create(dir.join(name)).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), OUT_W, OUT_H);
+    e.set_color(png::ColorType::Rgb);
+    e.set_depth(png::BitDepth::Eight);
+    let px: Vec<u8> = rgb
+        .iter()
+        .copied()
+        .cycle()
+        .take((OUT_W * OUT_H * 3) as usize)
+        .collect();
+    e.write_header().unwrap().write_image_data(&px).unwrap();
+}
+
+#[test]
+fn the_shelf_wallpaper_changes_with_the_shelf_and_a_missing_file_shows_no_other_shelfs() {
+    let Ok(surface) = HeadlessSurface::new() else {
+        return;
+    };
+    let Ok(mut c) = Compositor::new(&surface) else {
+        return;
+    };
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    put_game_boy_carts(d.path());
+    clocked(d.path());
+    let state = slot_store::read_slot_state(d.path());
+    slot_store::write_slot_state(
+        d.path(),
+        &slot_store::SlotState {
+            wallpaper: slot_store::WallpaperPick::Shelf,
+            ..state
+        },
+    )
+    .unwrap();
+    solid_wallpaper(d.path(), "GBA.png", [200, 0, 0]);
+    solid_wallpaper(d.path(), "GB.png", [0, 0, 200]);
+    let mut f = Frontend::boot(Box::new(SimPlatform::at(d.path().to_path_buf())));
+    f.upload_faces(&mut c);
+    let mut input = Script(VecDeque::new());
+    f.advance(&mut input);
+    let_the_name_in(&mut f, &mut c, &mut input);
+
+    let mut fields = Vec::new();
+    for _ in 0..60 {
+        f.compose(&mut c);
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    for name in ["gba-wall", "gbc-wall", "gb-wall"] {
+        fields.push(field(&composed(&mut f, &mut c, name)));
+        tap(&mut f, &mut input, Btn::R1);
+        let_the_name_in(&mut f, &mut c, &mut input);
+    }
+    assert!(
+        fields[0][0] > 150 && fields[0][2] < 50,
+        "GBA: {:?}",
+        fields[0]
+    );
+    assert!(
+        !(fields[1][0] > 150 && fields[1][2] < 50),
+        "the GBC shelf kept the GBA wallpaper: {:?}",
+        fields[1]
+    );
+    assert!(
+        fields[2][2] > 150 && fields[2][0] < 50,
+        "GB: {:?}",
+        fields[2]
     );
 }
 
@@ -431,7 +523,7 @@ fn a_cart_going_in_from_a_repeated_row_takes_both_copies_of_its_neighbour_with_i
     app.update(SEATED_AT / 2.0);
     let halfway = shot(&app, &mut c, Some("insert-1-halfway"));
     let (mid, y) = span(&halfway, ink);
-    for _ in 0..120 {
+    for _ in 0..16 {
         app.update(1.0 / 60.0);
     }
     let seated = shot(&app, &mut c, Some("insert-2-seated"));
@@ -612,7 +704,7 @@ fn frame(c: &mut Compositor, out: &[Draw], name: &str) -> Vec<u8> {
 
 fn frame_named(c: &mut Compositor, out: &[Draw], name: Option<&str>) -> Vec<u8> {
     c.set_screen_power(1.0);
-    c.begin_frame(slot_gfx::Layout::Framed);
+    c.begin_frame();
     c.draw_list(out);
     let px = c.read_frame();
     if let (Some(name), Ok(dir)) = (name, std::env::var("SCRATCH_PNG_DIR")) {
@@ -642,6 +734,7 @@ fn cartridges() -> [(&'static str, Cart); 2] {
                 code: String::new(),
                 shell: None,
                 title: "POKEMON EMER".into(),
+                tags: Vec::new(),
             },
         ),
         (
@@ -654,6 +747,7 @@ fn cartridges() -> [(&'static str, Cart); 2] {
                 code: String::new(),
                 shell: None,
                 title: "TETRIS".into(),
+                tags: Vec::new(),
             },
         ),
     ]
@@ -735,13 +829,13 @@ fn both_cartridges_go_into_the_slot_at_their_own_size() {
             };
             if seat == 0.0 {
                 assert!(
-                    (top as f32 - rest_y(h as f32)).abs() < 1.5,
+                    (top as f32 - rest_y(slot_ui::Canvas::FRAMED, h as f32)).abs() < 1.5,
                     "{name} stands with its top edge at {top}, not at {} where the carousel \
                      centres a {h} px cartridge",
-                    rest_y(h as f32)
+                    rest_y(slot_ui::Canvas::FRAMED, h as f32)
                 );
                 let middle = (top + bottom) as f32 / 2.0;
-                let want = rest_y(h as f32) + h as f32 / 2.0;
+                let want = rest_y(slot_ui::Canvas::FRAMED, h as f32) + h as f32 / 2.0;
                 assert!(
                     (middle - want).abs() < 1.5,
                     "{name} stands {top}..{bottom}, centred on {middle} rather than on {want}"
@@ -831,6 +925,7 @@ fn a_recents_shelf_rings_paks_and_carts_together() {
     };
     let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
     put_game_boy_carts(d.path());
+    put_labels(d.path());
     let mut s = slot_store::read_slot_state(d.path());
     s.clock_set = true;
     s.show_recents = true;

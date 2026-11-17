@@ -5,15 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+nds = ["slot-store/nds"]
+
 [dependencies]
 fontdue = { workspace = true }
+rustybuzz = { workspace = true }
+serde_json = { workspace = true }
 png = { workspace = true }
 resvg = { workspace = true }
 usvg = { workspace = true }
 slot-gfx = { path = "../slot-gfx", default-features = false }
+slot-input = { path = "../slot-input" }
 slot-power = { path = "../slot-power" }
 slot-store = { path = "../slot-store" }
 
 [dev-dependencies]
+rqrr = { version = "0.11.0", default-features = false }
+qrcode = { workspace = true }
 slot-gfx = { path = "../slot-gfx", default-features = false, features = ["test-support"] }
 tempfile.workspace = true

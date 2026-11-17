@@ -1,6 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use slot_gfx::{Canvas, Compositor, Draw, HeadlessSurface, Layout, ScreenEffect, SRC_H, SRC_W};
+use slot_gfx::{
+    bezel_column, game_rect, hole_on_top, Canvas, Compositor, Draw, HeadlessSurface, ScreenEffect,
+    SRC_H, SRC_W,
+};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 static GL: Mutex<()> = Mutex::new(());
@@ -27,65 +30,23 @@ fn pattern() -> Vec<u8> {
         .collect()
 }
 
-fn framed_frame(c: &mut Compositor) -> Vec<u8> {
-    c.fit((640, 480));
-    c.set_screen_effect(ScreenEffect::Lcd3x);
-    c.set_screen_power(1.0);
-    let badge = c.create_texture(2, 2, &[200, 40, 40, 255].repeat(4));
-    c.begin_frame(Layout::Framed);
-    c.upload_game(&pattern());
-    c.draw_list(&[
-        Draw::Game,
-        Draw::Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 720.0,
-            h: 40.0,
-            colour: [0.0, 0.0, 0.0, 0.5],
-        },
-        Draw::Tex {
-            x: 690.0,
-            y: 10.0,
-            w: 20.0,
-            h: 20.0,
-            tex: badge,
-            alpha: 1.0,
-        },
-    ]);
-    c.read_frame()
-}
-
-const FRAMED_HASH: u64 = 0xe3b9_652d_e7d2_eb8c;
-
 #[test]
-fn a_framed_frame_on_a_4_by_3_panel_is_todays_frame() {
-    let Some((_g, _s, mut c)) = compositor() else {
-        return;
-    };
-    let frame = framed_frame(&mut c);
-    assert_eq!(frame.len(), 640 * 427 * 4);
-    assert_eq!(fnv(&frame), FRAMED_HASH, "hash is {:#x}", fnv(&frame));
+fn the_canvas_on_a_4_by_3_panel_is_the_panel_at_480_lines() {
+    assert_eq!(Canvas::of((640, 480)), Canvas { w: 640.0, h: 480.0 });
+    assert_eq!(Canvas::of((1280, 960)), Canvas { w: 640.0, h: 480.0 });
 }
 
 #[test]
-fn a_native_canvas_on_a_4_by_3_panel_is_the_panel_at_480_lines() {
-    assert_eq!(
-        Canvas::of(Layout::Native, (640, 480)),
-        Canvas { w: 640.0, h: 480.0 }
-    );
-    assert_eq!(
-        Canvas::of(Layout::Native, (1280, 960)),
-        Canvas { w: 640.0, h: 480.0 }
-    );
-    assert_eq!(Canvas::of(Layout::Framed, (640, 480)), Canvas::FRAMED);
-}
-
-#[test]
-fn every_layout_is_the_framed_canvas_on_a_panel_that_is_not_4_by_3() {
+fn the_canvas_is_720_by_480_on_a_panel_that_is_not_4_by_3() {
     for panel in [(720, 480), (1440, 960), (0, 0)] {
-        assert_eq!(Canvas::of(Layout::Native, panel), Canvas::FRAMED);
-        assert_eq!(Canvas::of(Layout::Framed, panel), Canvas::FRAMED);
+        assert_eq!(Canvas::of(panel), Canvas::FRAMED);
     }
+}
+
+#[test]
+fn the_game_area_on_a_4_by_3_panel_is_3_by_2_at_the_top_or_the_middle() {
+    assert_eq!(game_rect((640, 480), true), (0, 0, 640, 427));
+    assert_eq!(game_rect((640, 480), false), (0, 27, 640, 427));
 }
 
 #[test]
@@ -110,7 +71,7 @@ fn a_part_draws_only_its_window_of_the_texture() {
     }
     let tex = c.create_texture_nearest(3, 2, &rgba);
     c.fit((720, 480));
-    c.begin_frame(Layout::Framed);
+    c.begin_frame();
     c.draw_list(&[Draw::Part {
         x: 0.0,
         y: 0.0,
@@ -143,7 +104,7 @@ fn a_native_frame_on_a_4_by_3_panel_is_the_whole_panel() {
         return;
     };
     c.fit((640, 480));
-    c.begin_frame(Layout::Native);
+    c.begin_frame();
     c.draw_list(&[Draw::Rect {
         x: 630.0,
         y: 0.0,
@@ -161,80 +122,51 @@ fn a_native_frame_on_a_4_by_3_panel_is_the_whole_panel() {
     );
 }
 
-#[test]
-fn a_framed_frame_after_a_native_one_is_todays_frame_again() {
-    let Some((_g, _s, mut c)) = compositor() else {
-        return;
-    };
+fn game_only(c: &mut Compositor, sp_frame: bool) -> Vec<u8> {
     c.fit((640, 480));
-    c.begin_frame(Layout::Native);
-    let frame = framed_frame(&mut c);
-    assert_eq!(fnv(&frame), FRAMED_HASH);
-}
-
-fn game_only(c: &mut Compositor, layout: Layout) -> Vec<u8> {
-    c.fit((640, 480));
-    c.set_screen_effect(ScreenEffect::Lcd3x);
+    c.set_sp_frame(sp_frame);
+    c.set_screen_effect(ScreenEffect::None);
     c.set_screen_power(1.0);
-    c.begin_frame(layout);
+    c.begin_frame();
     c.upload_game(&pattern());
     c.draw_list(&[Draw::Game]);
     c.read_frame()
 }
 
 #[test]
-fn a_game_in_a_native_frame_sits_where_the_framed_one_does() {
+fn a_game_on_a_4_by_3_panel_fills_its_game_area_and_nothing_else() {
     let Some((_g, _s, mut c)) = compositor() else {
         return;
     };
-    let framed = game_only(&mut c, Layout::Framed);
-    let native = game_only(&mut c, Layout::Native);
-    assert_eq!(native.len(), 640 * 480 * 4);
     let row = 640 * 4;
-    let worst = native[..427 * row]
-        .iter()
-        .zip(&framed)
-        .map(|(a, b)| a.abs_diff(*b))
-        .max();
-    assert!(
-        worst.unwrap_or(0) <= 1,
-        "the paused game moved or rescaled under a native frame: off by {worst:?}"
+    let top = game_only(&mut c, true);
+    let middle = game_only(&mut c, false);
+    assert_eq!(top.len(), 640 * 480 * 4);
+    assert_eq!(
+        fnv(&top[..427 * row]),
+        fnv(&middle[27 * row..454 * row]),
+        "the game is not the same picture at the top and in the middle"
     );
     assert!(
-        native[427 * row..].chunks(4).all(|p| p[..3] == [0, 0, 0]),
-        "the strip under the game is not clear"
+        top[427 * row..].chunks(4).all(|p| p[..3] == [0, 0, 0]),
+        "the strip under a game at the top is not clear"
     );
-}
-
-fn strip_bezel(c: &mut Compositor) {
-    let mut rgba = vec![0u8; 640 * 480 * 4];
-    for y in 427..480 {
-        for x in 0..640 {
-            let o = (y * 640 + x) * 4;
-            rgba[o..o + 4].copy_from_slice(&[220, 30, 30, 255]);
-        }
-    }
-    c.set_bezel(640, 480, &rgba);
-}
-
-fn red_rows(panel: &[u8]) -> Vec<usize> {
-    (0..480)
-        .filter(|y| {
-            let o = (y * 640 + 320) * 4;
-            panel[o] > 200 && panel[o + 1] < 60
-        })
-        .collect()
+    assert!(
+        middle[..27 * row]
+            .chunks(4)
+            .chain(middle[454 * row..].chunks(4))
+            .all(|p| p[..3] == [0, 0, 0]),
+        "the bands around a game in the middle are not clear"
+    );
 }
 
 #[test]
-fn a_native_frame_reaches_the_panel_one_to_one() {
+fn a_frame_reaches_a_4_by_3_panel_one_to_one() {
     let Some((_g, _s, mut c)) = compositor() else {
         return;
     };
     c.fit((640, 480));
-    strip_bezel(&mut c);
-    c.set_overlay_slide(1.0);
-    c.begin_frame(Layout::Native);
+    c.begin_frame();
     c.draw_list(&[Draw::Rect {
         x: 0.0,
         y: 0.0,
@@ -246,40 +178,160 @@ fn a_native_frame_reaches_the_panel_one_to_one() {
     let panel = c.read_window((640, 480));
     assert_eq!(
         panel, canvas,
-        "the native frame was moved or scaled on its way out"
+        "the frame was moved or scaled on its way out"
     );
-    assert!(
-        red_rows(&panel).is_empty(),
-        "the overlay drew over a native frame"
+}
+
+fn column(paint: impl Fn(usize) -> u8) -> Vec<u8> {
+    (0..480).map(paint).collect()
+}
+
+const GBA: (f32, f32) = (0.0, 1.0);
+const GB: (f32, f32) = (0.05, 0.9);
+
+#[test]
+fn a_bezel_that_would_cover_the_bottom_of_a_centred_game_has_its_hole_on_top() {
+    let ags = column(|y| if y < 427 { 0 } else { 255 });
+    let notched = column(|y| if (27..427).contains(&y) { 0 } else { 255 });
+    let gb_chin = column(|y| if y < 405 { 0 } else { 255 });
+    assert!(hole_on_top(&ags, (640, 480), GBA));
+    assert!(hole_on_top(&notched, (640, 480), GBA));
+    assert!(hole_on_top(&gb_chin, (640, 480), GB));
+}
+
+#[test]
+fn a_bezel_clear_below_a_centred_game_keeps_it_centred() {
+    let framed = column(|y| if (27..454).contains(&y) { 0 } else { 255 });
+    let open = column(|_| 0);
+    let tinted = column(|_| 60);
+    let game_area = column(|y| if (27..454).contains(&y) { 255 } else { 0 });
+    let gb_frame = column(|y| if (48..432).contains(&y) { 0 } else { 255 });
+    assert!(!hole_on_top(&game_area, (640, 480), GBA));
+    assert!(!hole_on_top(&framed, (640, 480), GBA));
+    assert!(!hole_on_top(&open, (640, 480), GBA));
+    assert!(!hole_on_top(&tinted, (640, 480), GBA));
+    assert!(!hole_on_top(&gb_frame, (640, 480), GB));
+}
+
+#[test]
+fn a_bezel_on_a_panel_that_is_not_4_by_3_never_has_its_hole_on_top() {
+    let open = vec![0u8; 480];
+    assert!(!hole_on_top(&open, (720, 480), GBA));
+}
+
+#[test]
+fn a_bezel_column_is_the_alpha_down_the_middle() {
+    let mut rgba = vec![0u8; 640 * 480 * 4];
+    rgba[(479 * 640 + 320) * 4 + 3] = 200;
+    let column = bezel_column(&rgba, (640, 480));
+    assert_eq!(column.len(), 480);
+    assert_eq!(column[479], 200);
+    assert_eq!(column[0], 0);
+    assert!(bezel_column(&rgba, (720, 480)).is_empty());
+}
+
+#[test]
+fn every_panel_gets_its_own_canvas() {
+    for (panel, canvas) in [
+        ((720, 480), (720.0, 480.0)),
+        ((640, 480), (640.0, 480.0)),
+        ((720, 720), (720.0, 720.0)),
+        ((1024, 768), (800.0, 600.0)),
+        ((1440, 960), (720.0, 480.0)),
+        ((1280, 960), (640.0, 480.0)),
+        ((1440, 1440), (720.0, 720.0)),
+        ((2048, 1536), (800.0, 600.0)),
+        ((1920, 1080), (960.0, 540.0)),
+        ((1000, 700), (1000.0, 700.0)),
+    ] {
+        let c = Canvas::of(panel);
+        assert_eq!((c.w, c.h), canvas, "{panel:?}");
+    }
+}
+
+#[test]
+fn a_panel_smaller_than_640_by_480_keeps_the_fitted_reference() {
+    assert_eq!(Canvas::of((600, 400)), Canvas::FRAMED);
+}
+
+#[test]
+fn only_640_by_480_canvases_are_framed() {
+    assert!(slot_gfx::framed((640, 480)));
+    assert!(slot_gfx::framed((1280, 960)));
+    assert!(!slot_gfx::framed((1024, 768)));
+    assert!(!slot_gfx::framed((720, 720)));
+    assert!(!slot_gfx::framed((720, 480)));
+}
+
+#[test]
+fn the_host_scale_is_whole() {
+    assert_eq!(slot_gfx::canvas_scale((1440, 960)), 2);
+    assert_eq!(slot_gfx::canvas_scale((2048, 1536)), 2);
+    assert_eq!(slot_gfx::canvas_scale((1024, 768)), 1);
+}
+
+#[test]
+fn fitting_a_panel_sizes_the_frame_once() {
+    let Some((_g, _s, mut c)) = compositor() else {
+        return;
+    };
+    for panel in [(720, 720), (1024, 768), (640, 480)] {
+        c.fit(panel);
+        let fitted = c.frame_size();
+        c.begin_frame();
+        assert_eq!(fitted, c.frame_size(), "{panel:?}");
+    }
+}
+
+fn placeholder_frame(c: &mut Compositor, power: f32) -> Vec<u8> {
+    c.fit((720, 720));
+    c.set_game_layout(slot_gfx::game_layout(
+        (720, 720),
+        (240, 160),
+        slot_gfx::Sizing::Integer,
+    ));
+    c.set_placeholder_bezel(Some([50.0 / 255.0, 205.0 / 255.0, 50.0 / 255.0, 1.0]));
+    c.set_screen_power(power);
+    c.begin_frame();
+    c.upload_game(&pattern());
+    c.draw_list(&[Draw::Game]);
+    c.read_frame()
+}
+
+#[test]
+fn the_placeholder_bezel_collapses_with_the_screen() {
+    let Some((_g, _s, mut c)) = compositor() else {
+        return;
+    };
+    let at = |px: &[u8], y: usize| {
+        let o = (y * 720 + 360) * 4;
+        [px[o], px[o + 1], px[o + 2]]
+    };
+    let lime = [50, 205, 50];
+    let on = placeholder_frame(&mut c, 1.0);
+    assert_eq!(at(&on, 30), lime);
+    let opening = placeholder_frame(&mut c, 0.5);
+    assert_ne!(
+        at(&opening, 30),
+        lime,
+        "lime shows outside the opening screen"
+    );
+    assert_eq!(
+        at(&opening, 130),
+        lime,
+        "lime is missing around the opening picture"
     );
 }
 
 #[test]
-fn the_overlay_fills_the_strip_when_up_and_drops_as_it_slides() {
+fn the_ds_plus_draws_its_800_by_600_layout_on_the_whole_panel() {
+    assert_eq!(slot_gfx::panel_pixels((1024, 768)), (1024, 768));
+    assert_eq!(slot_gfx::panel_pixels((2048, 1536)), (1024, 768));
+    assert_eq!(slot_gfx::panel_pixels((720, 720)), (720, 720));
     let Some((_g, _s, mut c)) = compositor() else {
         return;
     };
-    c.fit((640, 480));
-    strip_bezel(&mut c);
-    for (slide, top) in [(1.0, Some(427)), (0.5, Some(453)), (0.0, None)] {
-        c.set_overlay_slide(slide);
-        c.begin_frame(Layout::Framed);
-        let panel = c.read_window((640, 480));
-        let rows = red_rows(&panel);
-        match top {
-            Some(top) => {
-                let first = *rows.first().expect("no overlay on the panel");
-                assert!(
-                    first.abs_diff(top) <= 1,
-                    "at slide {slide} the overlay starts at row {first}, not {top}"
-                );
-                assert_eq!(
-                    *rows.last().unwrap(),
-                    479,
-                    "the overlay does not reach the bottom"
-                );
-            }
-            None => assert!(rows.is_empty(), "the overlay shows at slide 0"),
-        }
-    }
+    c.fit((1024, 768));
+    c.begin_frame();
+    assert_eq!(c.frame_size(), (1024, 768));
 }

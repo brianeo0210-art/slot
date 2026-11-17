@@ -23,6 +23,29 @@ fn levels_clamp_and_persist() {
 }
 
 #[test]
+fn brightness_down_past_the_bottom_dims_and_up_undims_first() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut a = boot(d.path());
+    for _ in 0..20 {
+        a.apply(Action::BrightnessDown);
+    }
+    a.flush_state();
+    let s = read_slot_state(d.path());
+    assert_eq!((s.brightness, s.dim), (0, 6));
+    assert_eq!(a.brightness_level(), 0);
+    a.apply(Action::BrightnessUp);
+    assert_eq!((a.brightness(), a.dim()), (0, 5));
+    assert_eq!(a.brightness_level(), 1);
+    for _ in 0..5 {
+        a.apply(Action::BrightnessUp);
+    }
+    assert_eq!((a.brightness(), a.dim()), (0, 0));
+    a.apply(Action::BrightnessUp);
+    assert_eq!((a.brightness(), a.dim()), (1, 0));
+    assert_eq!(a.brightness_level(), 7);
+}
+
+#[test]
 fn volume_moves_five_per_press() {
     let d = tmp_root_with_carts(&["Emerald"]);
     let mut a = boot(d.path());
@@ -111,4 +134,20 @@ fn the_mute_survives_a_reboot() {
     let b = boot(d.path());
     assert!(b.muted());
     assert_eq!(b.volume(), 70);
+}
+
+#[test]
+fn turning_the_volume_up_saves_the_unmute_with_the_level() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut a = app_playing_with_volume(d.path(), 70);
+    a.apply_at(Action::MuteToggle, 0);
+    a.flush_state();
+    a.apply_at(Action::VolumeUp, 1_000);
+    a.flush_state();
+    let saved = read_slot_state(d.path());
+    assert_eq!(saved.volume, 75);
+    assert!(
+        !saved.muted,
+        "the card still says muted after the sound came back"
+    );
 }

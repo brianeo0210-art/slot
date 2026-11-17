@@ -390,7 +390,7 @@ pub struct LibretroCore {
     rom_path: Option<CString>,
     av: AvInfo,
     loaded: bool,
-    state_size: Option<usize>,
+    state_size: Option<(usize, usize)>,
     _lib: Library,
 }
 
@@ -406,10 +406,19 @@ impl LibretroCore {
     }
 
     pub fn open_with(dylib: &Path, system_dir: &Path, save_dir: &Path) -> Result<Self, CoreError> {
+        Self::open_preset(dylib, system_dir, save_dir, &[])
+    }
+
+    pub fn open_preset(
+        dylib: &Path,
+        system_dir: &Path,
+        save_dir: &Path,
+        preset: &[(&str, &str)],
+    ) -> Result<Self, CoreError> {
         if LIVE.swap(true, Ordering::SeqCst) {
             return Err(CoreError::Unsupported("a core is already open".into()));
         }
-        Self::open_inner(dylib, system_dir, save_dir)
+        Self::open_inner(dylib, system_dir, save_dir, preset)
             .inspect_err(|_| LIVE.store(false, Ordering::SeqCst))
     }
 
@@ -462,7 +471,12 @@ impl LibretroCore {
             .map(|s| s.to_string())
     }
 
-    fn open_inner(dylib: &Path, system_dir: &Path, save_dir: &Path) -> Result<Self, CoreError> {
+    fn open_inner(
+        dylib: &Path,
+        system_dir: &Path,
+        save_dir: &Path,
+        preset: &[(&str, &str)],
+    ) -> Result<Self, CoreError> {
         let lib = unsafe { Library::new(dylib) }.map_err(|e| CoreError::Load(e.to_string()))?;
         let api = unsafe { Api::load(&lib) }?;
         let version = unsafe { (api.api_version)() };
@@ -482,7 +496,10 @@ impl LibretroCore {
             net: Link::default(),
             net_peer: None,
             audio_status: None,
-            options: std::collections::HashMap::new(),
+            options: preset
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_string(), CString::new(*v).ok()?)))
+                .collect(),
             options_dirty: false,
             declared: std::collections::HashMap::new(),
         });
@@ -611,6 +628,14 @@ impl RetroCore for LibretroCore {
         unsafe { (self.api.run)() };
     }
 
+    fn reset(&mut self) {
+        if !self.loaded {
+            return;
+        }
+        let _a = Active::bind(&mut self.host);
+        unsafe { (self.api.reset)() };
+    }
+
     fn set_frame_skip(&mut self, skip: bool) {
         let _a = Active::bind(&mut self.host);
         unsafe { report_audio_status(skip) };
@@ -625,11 +650,16 @@ impl RetroCore for LibretroCore {
     }
 
     fn serialize(&mut self) -> Result<Vec<u8>, CoreError> {
-        if let Some(buf) = self.state_size.and_then(|size| self.serialize_at(size)) {
+        let chip = unsafe { (self.api.get_memory_size)(MEMORY_SAVE_RAM) };
+        if let Some(buf) = self
+            .state_size
+            .filter(|&(_, at)| at == chip)
+            .and_then(|(size, _)| self.serialize_at(size))
+        {
             return Ok(buf);
         }
         let size = unsafe { (self.api.serialize_size)() };
-        self.state_size = (size > 0).then_some(size);
+        self.state_size = (size > 0).then_some((size, chip));
         if size == 0 {
             return Err(CoreError::State("core reports no state".into()));
         }
@@ -638,6 +668,9 @@ impl RetroCore for LibretroCore {
     }
 
     fn unserialize(&mut self, data: &[u8]) -> Result<(), CoreError> {
+        if data.is_empty() {
+            return Err(CoreError::State("empty state".into()));
+        }
         let ok = {
             let _a = Active::bind(&mut self.host);
             unsafe { (self.api.unserialize)(data.as_ptr() as *const c_void, data.len()) }
@@ -665,6 +698,13 @@ impl RetroCore for LibretroCore {
         ram[..n].copy_from_slice(&data[..n]);
         let rest = &data[n..];
         if let Some(rtc) = self.memory_mut(MEMORY_RTC) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let converted = (rest.len() != rtc.len())
+                .then(|| crate::rtc::convert(rest, rtc.len(), now))
+                .flatten();
+            let rest = converted.as_deref().unwrap_or(rest);
             let m = rtc.len().min(rest.len());
             rtc[..m].copy_from_slice(&rest[..m]);
         }

@@ -9,7 +9,6 @@ fn seated(cart: &str) -> SlotState {
     SlotState {
         cart: Some(cart.into()),
         clock_set: true,
-        utc_offset_min: 0,
         ..Default::default()
     }
 }
@@ -23,6 +22,59 @@ fn boot_with_a_seated_cart_never_shows_the_shelf() {
         matches!(a.phase(), Phase::Inserting { .. }),
         "boot must go straight to the seated cart, not the shelf"
     );
+}
+
+#[test]
+fn resume_on_power_on_alone_decides_whether_boot_reseats_the_cart_fresh() {
+    for (resume_insert, resume_power_on) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        let d = tmp_root_with_carts(&["Emerald"]);
+        let s = SlotState {
+            resume_insert,
+            resume_power_on,
+            ..seated("Emerald")
+        };
+        write_slot_state(d.path(), &s).unwrap();
+        let a = App::boot(d.path());
+        assert!(matches!(a.phase(), Phase::Inserting { .. }));
+        assert_eq!(
+            a.starting_clean(),
+            !resume_power_on,
+            "resume_insert {resume_insert} resume_power_on {resume_power_on}"
+        );
+    }
+}
+
+#[test]
+fn an_old_auto_load_state_becomes_the_two_resume_rows() {
+    for (value, insert, power_on) in [
+        ("1", true, true),
+        ("power", false, true),
+        ("0", false, false),
+    ] {
+        let d = tmp_root_with_carts(&["Emerald"]);
+        write_slot_state(d.path(), &seated("Emerald")).unwrap();
+        let path = d.path().join("Config/slot.state");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("resume_insert=1\n"), "{text}");
+        assert!(text.contains("resume_power_on=1\n"), "{text}");
+        let old = text
+            .lines()
+            .filter(|l| !l.starts_with("resume_"))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+            + &format!("auto_load={value}\neject_save=0\n");
+        std::fs::write(&path, old).unwrap();
+        let s = read_slot_state(d.path());
+        assert_eq!(
+            (s.resume_insert, s.resume_power_on),
+            (insert, power_on),
+            "{value}"
+        );
+        let a = App::boot(d.path());
+        assert_eq!(a.starting_clean(), !power_on, "{value}");
+    }
 }
 
 #[test]
@@ -128,7 +180,6 @@ fn seating_a_cart_preserves_the_levels_already_in_the_file() {
             volume: 35,
             muted: false,
             clock_set: true,
-            utc_offset_min: 0,
             ..SlotState::default()
         },
     )
@@ -152,7 +203,6 @@ fn a_resume_draws_no_shelf_but_a_chosen_insert_does() {
             &SlotState {
                 cart: Some("Emerald".into()),
                 clock_set: true,
-                utc_offset_min: 0,
                 ..Default::default()
             },
         )
@@ -165,7 +215,6 @@ fn a_resume_draws_no_shelf_but_a_chosen_insert_does() {
             d.path(),
             &SlotState {
                 clock_set: true,
-                utc_offset_min: 0,
                 ..Default::default()
             },
         )
@@ -272,7 +321,6 @@ fn resumed(d: &tempfile::TempDir, platform: Option<Platform>) -> App {
             cart: Some("Tetris".into()),
             cart_platform: platform,
             clock_set: true,
-            utc_offset_min: 0,
             ..Default::default()
         },
     )
@@ -328,7 +376,7 @@ fn a_named_shelf_that_no_longer_has_the_cart_is_an_empty_slot() {
 fn seating_a_cart_records_the_shelf_it_came_off() {
     let d = two_tetrises();
     let mut a = boot(d.path());
-    a.apply(Action::GbaDown(Btn::R1));
+    common::through(&mut a, Btn::R1);
     assert_eq!(
         a.selected_stem(),
         Some("Tetris"),
@@ -379,7 +427,6 @@ fn a_resumed_cart_starts_seated() {
         &SlotState {
             cart: Some("Emerald".into()),
             clock_set: true,
-            utc_offset_min: 0,
             ..Default::default()
         },
     )

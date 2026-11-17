@@ -67,9 +67,10 @@ fn every_option_slot_sets_is_one_the_core_declares() {
                 for (colour, platform) in [false, true]
                     .into_iter()
                     .flat_map(|c| Platform::ALL.map(|p| (c, p)))
+                    .filter(|(_, p)| which.runs(*p))
                 {
                     for palette in
-                        std::iter::once(None).chain(slot_store::GbPalette::all().map(Some))
+                        std::iter::once(None).chain(slot_store::GbColors::all().map(Some))
                     {
                         let mut core = LibretroCore::open(&path).expect("open core");
                         slot::core::apply_core_options(
@@ -173,7 +174,7 @@ fn a_named_palette_forces_a_plain_game_boy_without_hardware_presets() {
         "auto",
         false,
         false,
-        Some(p),
+        Some(slot_store::GbColors::Palette(p)),
     );
     let set: std::collections::HashMap<String, String> = core.options().into_iter().collect();
     assert_eq!(
@@ -239,47 +240,202 @@ fn a_linked_game_never_takes_a_named_palette() {
     bytes[0x146] = 0x03;
     let rom = d.path().join("sgb.gb");
     std::fs::write(&rom, bytes).unwrap();
-    let p = slot_store::GbPalette::DEFAULT;
+    let p = slot_store::GbColors::Palette(slot_store::GbPalette::DEFAULT);
     let gb = slot_store::Platform::Gb;
-    assert_eq!(slot::core::palette_for(Some(p), gb, &rom, None), Some(p));
+    assert_eq!(slot::core::palette_for(p, gb, &rom, None), Some(p));
     for player in [0, 1] {
         assert_eq!(
-            slot::core::palette_for(Some(p), gb, &rom, Some(player)),
+            slot::core::palette_for(p, gb, &rom, Some(player)),
             None,
             "player {player}: a linked pair would run two models of one cart"
         );
     }
-    assert_eq!(slot::core::palette_for(None, gb, &rom, None), None);
     assert_eq!(
-        slot::core::palette_for(Some(p), slot_store::Platform::Gba, &rom, None),
+        slot::core::palette_for(slot_store::GbColors::Auto, gb, &rom, None),
+        Some(slot_store::GbColors::Auto)
+    );
+    assert_eq!(
+        slot::core::palette_for(p, slot_store::Platform::Gba, &rom, None),
         None
     );
 }
 
 #[test]
-fn mgba_always_answers_the_game_boy_player_logo() {
+fn a_colour_game_keeps_autodetect() {
+    let d = tempfile::tempdir().unwrap();
+    let mut bytes = vec![0u8; 0x8000];
+    bytes[0x143] = 0x80;
+    let rom = d.path().join("dual.gbc");
+    std::fs::write(&rom, bytes).unwrap();
+    for platform in [slot_store::Platform::Gb, slot_store::Platform::Gbc] {
+        assert_eq!(
+            slot::core::palette_for(slot_store::GbColors::Auto, platform, &rom, None),
+            None,
+            "{platform:?}"
+        );
+    }
+}
+
+#[test]
+fn an_original_game_boy_game_runs_on_the_plain_model_with_auto() {
     let _g = common::core_lock();
     let path = dylib_for(Core::Mgba);
     if !path.exists() {
         eprintln!("no mgba dylib on this host, skipping");
         return;
     }
-    for palette in [None, slot_store::GbPalette::parse("SGB 1-A")] {
+    let mut core = LibretroCore::open(&path).expect("open core");
+    slot::core::apply_core_options(
+        &mut core,
+        Core::Mgba,
+        Platform::Gb,
+        "auto",
+        false,
+        false,
+        Some(slot_store::GbColors::Auto),
+    );
+    let set: std::collections::HashMap<String, String> = core.options().into_iter().collect();
+    assert_eq!(
+        set.get("mgba_gb_model").map(String::as_str),
+        Some("Game Boy")
+    );
+    assert_eq!(
+        set.get("mgba_gb_colors_preset").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(set.get("mgba_gb_colors").map(String::as_str), Some("Auto"));
+}
+
+#[test]
+fn mgba_answers_the_game_boy_player_logo_except_for_gba_video() {
+    let _g = common::core_lock();
+    let path = dylib_for(Core::Mgba);
+    if !path.exists() {
+        eprintln!("no mgba dylib on this host, skipping");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    for (platform, code, want, why) in [
+        (
+            Platform::Gba,
+            "BPPE",
+            "ON",
+            "Pokemon Pinball Ruby and Sapphire only rumbles on a Game Boy Player",
+        ),
+        (
+            Platform::Gba,
+            "MSSE",
+            "OFF",
+            "a GBA Video cart refuses to play on a Game Boy Player",
+        ),
+        (
+            Platform::Gbav,
+            "BPEE",
+            "OFF",
+            "the GBA Video shelf holds only videos",
+        ),
+    ] {
+        let mut bytes = vec![0u8; 0x100];
+        bytes[0xac..0xb0].copy_from_slice(code.as_bytes());
+        let rom = d.path().join(format!("{code}.gba"));
+        std::fs::write(&rom, bytes).unwrap();
         let mut core = LibretroCore::open(&path).expect("open core");
-        slot::core::apply_core_options(
-            &mut core,
-            Core::Mgba,
-            Platform::Gb,
-            "auto",
-            false,
-            false,
-            palette,
-        );
+        slot::core::apply_core_options(&mut core, Core::Mgba, platform, "auto", false, false, None);
+        slot::core::apply_game_boy_player(&mut core, Core::Mgba, platform, &rom);
         let set: std::collections::HashMap<String, String> = core.options().into_iter().collect();
         assert_eq!(
             set.get("mgba_force_gbp").map(String::as_str),
-            Some("ON"),
-            "Pokemon Pinball Ruby and Sapphire only rumbles on a Game Boy Player"
+            Some(want),
+            "{platform:?} {code}: {why}"
+        );
+    }
+}
+
+#[test]
+fn the_blending_off_slot_sets_is_one_the_core_declares() {
+    let _g = common::core_lock();
+    for which in Core::ALL {
+        let path = dylib_for(which);
+        if !path.exists() {
+            eprintln!("no {} dylib on this host, skipping", which.as_str());
+            continue;
+        }
+        let platform = test_platform(which);
+        let mut core = LibretroCore::open(&path).expect("open core");
+        slot::core::apply_core_options(&mut core, which, platform, "auto", false, false, None);
+        slot::core::apply_blending_off(&mut core, which);
+        every_option_is_one_the_core_has(&core, &format!("{} blending off", which.as_str()));
+        let (key, value) = slot::core::blending_off(which);
+        assert!(
+            core.options().iter().any(|(k, v)| k == key && v == value),
+            "{} was never told {key}={value}",
+            which.as_str()
+        );
+    }
+}
+
+#[test]
+fn both_cores_declare_a_frame_blending_option() {
+    let _g = common::core_lock();
+    for (which, key) in [
+        (Core::Mgba, "mgba_interframe_blending"),
+        (Core::Gpsp, "gpsp_frame_mixing"),
+    ] {
+        let path = dylib_for(which);
+        if !path.exists() {
+            eprintln!("no {} dylib on this host, skipping", which.as_str());
+            continue;
+        }
+        let core = LibretroCore::open(&path).expect("open core");
+        assert!(
+            core.declared_options().contains_key(key),
+            "{} declares no {key}",
+            which.as_str()
+        );
+    }
+}
+
+fn test_platform(which: Core) -> Platform {
+    if which.runs(Platform::Gba) {
+        Platform::Gba
+    } else {
+        Platform::Gb
+    }
+}
+
+#[test]
+fn the_sunlight_follows_the_clock_dark_at_night_and_brightest_at_noon() {
+    let at = |h: i64, m: i64| slot::core::sunlight_at(h * 3600 + m * 60);
+    assert_eq!(at(0, 0), 0);
+    assert_eq!(at(5, 59), 0);
+    assert_eq!(at(6, 0), 0);
+    assert_eq!(at(9, 0), 4);
+    assert_eq!(at(12, 0), 8);
+    assert_eq!(at(15, 0), 4);
+    assert_eq!(at(18, 0), 0);
+    assert_eq!(at(23, 59), 0);
+    assert_eq!(slot::core::sunlight_at(3 * 86_400 + 12 * 3600), 8);
+    assert_eq!(slot::core::sunlight_at(-12 * 3600), 8);
+}
+
+#[test]
+fn mgba_takes_every_sunlight_level_slot_can_send() {
+    let _g = common::core_lock();
+    let path = dylib_for(Core::Mgba);
+    if !path.exists() {
+        eprintln!("no mgba dylib on this host, skipping");
+        return;
+    }
+    let core = LibretroCore::open(&path).expect("open core");
+    let levels = core
+        .declared_options()
+        .get(slot::core::SUNLIGHT_OPTION)
+        .cloned()
+        .expect("mgba declares no solar sensor option");
+    for level in 0..=slot::core::SUNLIGHT_MAX {
+        assert!(
+            levels.contains(&level.to_string()),
+            "mgba has no sunlight level {level} in {levels:?}"
         );
     }
 }

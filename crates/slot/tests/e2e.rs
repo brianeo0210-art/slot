@@ -93,7 +93,7 @@ fn the_whole_pass_from_boot_to_resume() {
     let mut p = Pass::boot(root);
 
     assert!(matches!(p.session.app().phase(), Phase::SetClock { .. }));
-    p.tap(Btn::A);
+    p.tap(Btn::B);
 
     assert!(matches!(p.session.app().phase(), Phase::Shelf));
     assert!(!p.session.has_core());
@@ -156,12 +156,13 @@ fn the_whole_pass_from_boot_to_resume() {
         !matches!(s.app().phase(), Phase::Playing { .. })
     });
     p.event(RawEvent::Up(Btn::Menu));
-    assert!(p
-        .ring("Emerald")
-        .read_resume()
-        .expect("read resume")
-        .is_some());
-    assert_eq!(read_slot_state(root).cart, None);
+    let ring = p.ring("Emerald");
+    p.until("the resume state on the card", |_| {
+        ring.read_resume().expect("read resume").is_some()
+    });
+    p.until("the cart cleared from slot.state", |_| {
+        read_slot_state(root).cart.is_none()
+    });
     p.until("the shelf", |s| matches!(s.app().phase(), Phase::Shelf));
     assert!(!p.session.has_core(), "the core outlived the cart");
 

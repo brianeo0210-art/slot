@@ -46,17 +46,18 @@ fn brightness(d: &TempDir) -> u32 {
 
 fn platform(d: &TempDir) -> DevicePlatform {
     DevicePlatform::probe(d.path(), PathBuf::from("/mnt/sdcard"))
+        .with_sound_cards(d.path().join("asound/cards"))
 }
 
 #[test]
 fn the_backlight_steps_span_whatever_range_the_kernel_reports() {
     let d = sysfs("255", "87");
     let mut p = platform(&d);
-    p.set_backlight(9);
+    p.set_backlight(10);
     assert_eq!(brightness(&d), 255);
-    p.set_backlight(5);
+    p.set_backlight(6);
     let mid = brightness(&d);
-    assert!((40..=90).contains(&mid), "step 5 of 9 wrote {mid} of 255");
+    assert!((40..=110).contains(&mid), "step 6 of 10 wrote {mid} of 255");
 }
 
 #[test]
@@ -71,13 +72,13 @@ fn step_one_is_the_dimmest_value_the_rg34xx_lights() {
 fn the_steps_follow_the_curve_from_the_floor_to_full() {
     let d = sysfs("255", "87");
     let mut p = platform(&d);
-    let wrote: Vec<u32> = (0..=9)
+    let wrote: Vec<u32> = (0..=10)
         .map(|step| {
             p.set_backlight(step);
             brightness(&d)
         })
         .collect();
-    assert_eq!(wrote, [0, 8, 14, 30, 52, 81, 117, 157, 204, 255]);
+    assert_eq!(wrote, [0, 8, 13, 26, 44, 68, 96, 129, 167, 209, 255]);
 }
 
 #[test]
@@ -85,7 +86,7 @@ fn every_step_is_brighter_than_the_one_below() {
     let d = sysfs("255", "87");
     let mut p = platform(&d);
     let mut last = 0;
-    for step in 1..=9 {
+    for step in 1..=10 {
         p.set_backlight(step);
         let now = brightness(&d);
         assert!(now > last, "step {step} wrote {now}, not above {last}");
@@ -99,7 +100,7 @@ fn a_small_range_still_lights_step_one() {
     let mut p = platform(&d);
     p.set_backlight(1);
     assert_eq!(brightness(&d), 1);
-    p.set_backlight(9);
+    p.set_backlight(10);
     assert_eq!(brightness(&d), 10);
 }
 
@@ -212,7 +213,7 @@ fn dispdbg(d: &TempDir, file: &str) -> String {
 fn a_tree_with_no_backlight_class_drives_the_panel_through_dispdbg() {
     let d = dispdbg_tree();
     let mut p = DevicePlatform::probe(d.path(), PathBuf::from("/mnt/sdcard"));
-    p.set_backlight(9);
+    p.set_backlight(10);
     assert_eq!(dispdbg(&d, "name"), "lcd0");
     assert_eq!(dispdbg(&d, "command"), "setbl");
     assert_eq!(
@@ -231,7 +232,7 @@ fn a_backlight_class_still_wins_over_dispdbg() {
     let dbg = d.path().join("kernel/debug/dispdbg");
     fs::create_dir_all(&dbg).unwrap();
     fs::write(dbg.join("param"), "").unwrap();
-    platform(&d).set_backlight(9);
+    platform(&d).set_backlight(10);
     assert_eq!(brightness(&d), 255);
     assert_eq!(dispdbg(&d, "param"), "", "dispdbg was written to as well");
 }
@@ -380,6 +381,30 @@ fn headphones_follow_the_detection_pin() {
     assert!(!platform(&d).headphones());
 }
 
+const ONBOARD_CARDS: &str =
+    " 0 [audiocodec     ]: audiocodec - audiocodec\n                      audiocodec\n";
+
+const USB_DAC_CARDS: &str = " 0 [audiocodec     ]: audiocodec - audiocodec\n                      audiocodec\n 1 [D700           ]: USB-Audio - BTD 700\n                      Sennheiser BTD 700 at usb-sunxi-ehci-1, full speed\n";
+
+#[test]
+fn a_usb_audio_card_is_found_by_its_driver() {
+    assert_eq!(slot_power::usb_card(ONBOARD_CARDS), None);
+    assert_eq!(slot_power::usb_card(""), None);
+    assert_eq!(slot_power::usb_card(USB_DAC_CARDS), Some(1));
+}
+
+#[test]
+fn a_usb_dac_counts_as_headphones() {
+    let d = sysfs("255", "87");
+    with_jack(&d, "lo");
+    let cards = d.path().join("asound/cards");
+    fs::create_dir_all(cards.parent().unwrap()).unwrap();
+    fs::write(&cards, ONBOARD_CARDS).unwrap();
+    assert!(!platform(&d).headphones());
+    fs::write(&cards, USB_DAC_CARDS).unwrap();
+    assert!(platform(&d).headphones());
+}
+
 const MOUNTS: &str = "\
 /dev/mmcblk0p5 / ext4 rw,noatime 0 0
 /dev/mmcblk0p7 /mnt/sdcard vfat ro,noatime,fmask=0022,errors=remount-ro 0 0
@@ -434,4 +459,209 @@ fn the_kernel_log_keeps_the_latest_card_lines() {
     let kept = slot_power::card_kernel_lines(&dmesg);
     assert_eq!(kept.len(), 40);
     assert_eq!(kept.last().unwrap(), "[99] FAT-fs (mmcblk0p7): line 99");
+}
+
+#[test]
+fn the_card_is_found_with_its_device_and_filesystem() {
+    let m = slot_power::card_mount_in(MOUNTS, Path::new("/mnt/sdcard")).unwrap();
+    assert_eq!(m.device, "/dev/mmcblk0p7");
+    assert_eq!(m.point, Path::new("/mnt/sdcard"));
+    assert_eq!(m.fs, "vfat");
+    let other = slot_power::card_mount_in(MOUNTS, Path::new("/mnt/other/Saves")).unwrap();
+    assert_eq!(other.device, "/dev/mmcblk1p1");
+    assert_eq!(other.point, Path::new("/mnt/other"));
+    assert_eq!(other.fs, "exfat");
+}
+
+#[test]
+fn a_card_on_no_block_device_is_not_one_to_repair() {
+    assert!(slot_power::card_mount_in(MOUNTS, Path::new("/mnt/sdcard/System/slot")).is_none());
+}
+
+#[test]
+fn the_repair_is_staged_off_the_card() {
+    let card = tempfile::tempdir().unwrap();
+    let stage = tempfile::tempdir().unwrap();
+    let system = card.path().join("System");
+    fs::create_dir_all(&system).unwrap();
+    fs::write(system.join("repair.sh"), "#!/bin/sh\n").unwrap();
+    fs::write(system.join("fsck.exfat"), "elf").unwrap();
+    let script = slot_power::stage_repair(card.path(), stage.path()).unwrap();
+    assert_eq!(script, stage.path().join("repair.sh"));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "#!/bin/sh\n");
+    assert_eq!(
+        fs::read_to_string(stage.path().join("fsck.exfat")).unwrap(),
+        "elf"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(stage.path().join("fsck.exfat"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "fsck.exfat was staged without its execute bit"
+        );
+    }
+}
+
+#[test]
+fn a_card_without_the_script_cannot_stage_a_repair() {
+    let card = tempfile::tempdir().unwrap();
+    let stage = tempfile::tempdir().unwrap();
+    assert!(slot_power::stage_repair(card.path(), stage.path()).is_err());
+}
+
+#[test]
+fn the_repair_result_is_read_once() {
+    use slot_power::RepairResult;
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("slot-repair.result");
+    assert_eq!(slot_power::take_repair_result(&file), None);
+    for (text, want) in [
+        ("repaired\n", RepairResult::Repaired),
+        ("clean\n", RepairResult::Clean),
+        ("failed\n", RepairResult::Failed),
+        ("busy\n", RepairResult::Failed),
+        ("unsupported\n", RepairResult::Failed),
+    ] {
+        fs::write(&file, text).unwrap();
+        assert_eq!(slot_power::take_repair_result(&file), Some(want), "{text}");
+        assert!(!file.exists(), "{text} was left to be shown again");
+    }
+}
+
+fn second_panel(d: &TempDir, max: &str) -> PathBuf {
+    let bl = d.path().join("class/backlight/backlight-lcd1");
+    fs::create_dir_all(&bl).unwrap();
+    fs::write(bl.join("max_brightness"), format!("{max}\n")).unwrap();
+    fs::write(bl.join("brightness"), "7\n").unwrap();
+    bl.join("brightness")
+}
+
+fn read_value(file: &PathBuf) -> u32 {
+    fs::read_to_string(file).unwrap().trim().parse().unwrap()
+}
+
+#[test]
+fn closing_the_lid_darkens_both_screens() {
+    let d = sysfs("1666", "87");
+    let top = second_panel(&d, "1666");
+    let mut p = platform(&d);
+    p.set_backlight(0);
+    assert_eq!(brightness(&d), 0);
+    assert_eq!(read_value(&top), 0);
+}
+
+#[test]
+fn brightness_moves_both_screens_on_their_own_scales() {
+    let d = sysfs("255", "87");
+    let top = second_panel(&d, "1666");
+    let mut p = platform(&d);
+    p.set_backlight(10);
+    assert_eq!(brightness(&d), 255);
+    assert_eq!(read_value(&top), 1666);
+}
+
+fn sleep_script(d: &TempDir, body: &str) -> PathBuf {
+    let script = d.path().join("sleep.sh");
+    fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+fn lines_after(file: &Path, want: usize) -> usize {
+    for _ in 0..200 {
+        let n = fs::read_to_string(file)
+            .map(|t| t.lines().count())
+            .unwrap_or(0);
+        if n >= want {
+            return n;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fs::read_to_string(file)
+        .map(|t| t.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn sleep_runs_the_command_the_os_names() {
+    let d = sysfs("255", "87");
+    let mark = d.path().join("slept");
+    let script = sleep_script(&d, &format!("echo slept >> {}", mark.display()));
+    let mut p = platform(&d).with_sleep(script);
+    p.sleep();
+    assert_eq!(lines_after(&mark, 1), 1);
+}
+
+#[test]
+fn a_sleep_still_running_is_not_started_again() {
+    let d = sysfs("255", "87");
+    let mark = d.path().join("slept");
+    let script = sleep_script(&d, &format!("echo slept >> {}; sleep 0.3", mark.display()));
+    let mut p = platform(&d).with_sleep(script);
+    p.sleep();
+    lines_after(&mark, 1);
+    p.sleep();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(lines_after(&mark, 1), 1);
+    p.sleep();
+    assert_eq!(lines_after(&mark, 2), 2);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+#[test]
+fn without_an_os_sleep_command_sleep_does_nothing() {
+    let d = sysfs("255", "87");
+    let mut p = platform(&d);
+    p.sleep();
+}
+
+#[test]
+fn the_charging_led_is_left_to_the_kernel() {
+    let d = sysfs("255", "87");
+    for name in ["amber:charging", "green:power", "mmc0::", "red:status"] {
+        leds(&d, name, &[("brightness", "0"), ("max_brightness", "255")]);
+    }
+    let mut p = platform(&d);
+    p.set_led(LedState::Running);
+    p.set_led(LedState::Charging);
+    assert_eq!(
+        read(&d, "amber:charging/brightness"),
+        "0",
+        "slot drove the kernel's charging LED"
+    );
+    assert_eq!(read(&d, "green:power/brightness"), "255");
+}
+
+#[test]
+fn the_bottom_screen_backlight_powers_down_and_back_on_its_own() {
+    let d = sysfs("1666", "87");
+    let top = second_panel(&d, "1666");
+    let bottom_power = d.path().join("class/backlight/backlight-lcd0/bl_power");
+    let mut p = platform(&d);
+    p.set_bottom_backlight(false);
+    assert_eq!(fs::read_to_string(&bottom_power).unwrap(), "4");
+    assert!(!top.with_file_name("bl_power").exists());
+    p.set_backlight(10);
+    assert_eq!(fs::read_to_string(&bottom_power).unwrap(), "4");
+    p.set_bottom_backlight(true);
+    assert_eq!(fs::read_to_string(&bottom_power).unwrap(), "0");
+}
+
+#[test]
+fn one_screen_has_no_bottom_backlight_to_switch() {
+    let d = sysfs("255", "87");
+    let mut p = platform(&d);
+    p.set_bottom_backlight(false);
+    assert!(!d
+        .path()
+        .join("class/backlight/backlight-lcd0/bl_power")
+        .exists());
 }

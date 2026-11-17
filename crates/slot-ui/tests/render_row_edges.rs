@@ -26,6 +26,7 @@ fn shelf_with(n: usize) -> Shelf {
                 code: String::new(),
                 shell: None,
                 title: format!("GAME {i}"),
+                tags: Vec::new(),
             })
             .collect(),
     )
@@ -49,7 +50,7 @@ fn uploaded(n: usize, c: &mut Compositor) -> (Shelf, Vec<TexId>) {
 }
 
 fn composed(c: &mut Compositor, list: &[Draw]) -> Vec<u8> {
-    c.begin_frame(slot_gfx::Layout::Framed);
+    c.begin_frame();
     c.draw_list(list);
     c.read_frame()
 }

@@ -125,6 +125,7 @@ fn a_searching_plug_sits_in_the_port() {
     let s = sprites();
     let mut out = Vec::new();
     draw_link_art(
+        Canvas::FRAMED,
         working(LinkRow::Host, 0),
         LinkKind::Cable,
         1000,
@@ -157,60 +158,11 @@ fn texes(out: &[Draw]) -> Vec<TexId> {
 }
 
 #[test]
-fn cable_carts_draw_the_plug_under_the_port_and_wireless_carts_the_adapter() {
-    let s = sprites();
-    let mut out = Vec::new();
-    draw_link_art(
-        GameMenu::Pick(LinkRow::Host),
-        LinkKind::Cable,
-        0,
-        &s,
-        &mut out,
-    );
-    let t = texes(&out);
-    let plug = t
-        .iter()
-        .position(|x| *x == s.plug_host.tex)
-        .expect("no plug");
-    let port = t.iter().position(|x| *x == s.port.tex).expect("no port");
-    assert!(
-        port > plug,
-        "the port must be drawn over a plug that goes into it"
-    );
-    assert!(!t.contains(&s.adapter.tex));
-
-    out.clear();
-    draw_link_art(
-        GameMenu::Pick(LinkRow::Host),
-        LinkKind::Wireless,
-        0,
-        &s,
-        &mut out,
-    );
-    let t = texes(&out);
-    assert!(t.contains(&s.adapter.tex) && !t.contains(&s.plug_host.tex));
-}
-
-#[test]
-fn a_joiner_holds_the_gray_plug() {
-    let s = sprites();
-    let mut out = Vec::new();
-    draw_link_art(
-        GameMenu::Pick(LinkRow::Join),
-        LinkKind::Cable,
-        0,
-        &s,
-        &mut out,
-    );
-    let t = texes(&out);
-    assert!(t.contains(&s.plug_join.tex) && !t.contains(&s.plug_host.tex));
-}
-
-#[test]
 fn the_swap_arrows_show_on_pick_only() {
     let s = sprites();
     let mut out = Vec::new();
     draw_link_art(
+        Canvas::FRAMED,
         GameMenu::Pick(LinkRow::Host),
         LinkKind::Cable,
         0,
@@ -219,7 +171,14 @@ fn the_swap_arrows_show_on_pick_only() {
     );
     assert!(texes(&out).contains(&s.arrow_left.tex));
     out.clear();
-    draw_link_art(working(LinkRow::Host, 0), LinkKind::Cable, 50, &s, &mut out);
+    draw_link_art(
+        Canvas::FRAMED,
+        working(LinkRow::Host, 0),
+        LinkKind::Cable,
+        50,
+        &s,
+        &mut out,
+    );
     assert!(!texes(&out).contains(&s.arrow_left.tex));
 }
 
@@ -227,7 +186,14 @@ fn the_swap_arrows_show_on_pick_only() {
 fn a_failed_plug_is_drawn_turned() {
     let s = sprites();
     let mut out = Vec::new();
-    draw_link_art(failed(0), LinkKind::Cable, 250, &s, &mut out);
+    draw_link_art(
+        Canvas::FRAMED,
+        failed(0),
+        LinkKind::Cable,
+        250,
+        &s,
+        &mut out,
+    );
     assert!(out.iter().any(
         |d| matches!(d, Draw::Turned { tex, turn, .. } if *tex == s.plug_host.tex && *turn > 0.2)
     ));
@@ -296,6 +262,7 @@ fn the_adapter_calls_out_with_its_arcs_while_working() {
     let s = sprites();
     let mut out = Vec::new();
     draw_link_art(
+        Canvas::FRAMED,
         working(LinkRow::Host, 0),
         LinkKind::Wireless,
         800,

@@ -1,7 +1,8 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use slot_input::{Action, Gestures, Millis, RawEvent};
+use slot_input::{Action, Btn, Chord, Contexts, Entry, Gestures, Millis, Mod, RawEvent};
 use slot_retro::Rumble;
 use slot_store::Platform;
 use slot_ui::FfState;
@@ -11,20 +12,26 @@ pub const RUMBLE_MAX_MS: Millis = 150;
 
 use crate::app::{App, Phase};
 use crate::audio::{opened_sink, AudioSink, Ring, Sfx};
-use crate::core::open_core;
+use crate::core::{open_core, Opened};
 use crate::emu::{CoreState, EmuHandle, Speed};
 use crate::frames::FrameRef;
 use crate::input::Pad;
 use crate::persist;
 use crate::prefetch::Prefetch;
+use crate::print_scene::Cue;
 
 pub struct Session {
     root: PathBuf,
     app: App,
     emu: Option<EmuHandle>,
+    launches: u64,
+    opening: Option<Opening>,
     sink: Box<dyn AudioSink>,
     gestures: Gestures,
+    entries: Vec<Entry>,
+    captured: Vec<Btn>,
     pad: Pad,
+    sent: u16,
     rewinding: bool,
     fast: bool,
     motor: u16,
@@ -33,6 +40,9 @@ pub struct Session {
     reloading: bool,
     driven: bool,
     sync: crate::sync_radio::SyncRadio,
+    fixed_present: bool,
+    sunlight_sent: Option<u8>,
+    buzz_ends: Option<Instant>,
 }
 
 impl Session {
@@ -41,14 +51,19 @@ impl Session {
     }
 
     pub fn boot_with(root: PathBuf, sink: Box<dyn AudioSink>) -> Self {
-        let sync = crate::sync_radio::SyncRadio::new(&root);
+        let root_for_sync = root.clone();
         let mut session = Session {
             app: App::boot(&root),
             root,
             emu: None,
+            launches: 0,
+            opening: None,
             sink,
             gestures: Gestures::new(),
+            entries: Vec::new(),
+            captured: Vec::new(),
             pad: Pad::default(),
+            sent: 0,
             rewinding: false,
             fast: false,
             motor: 0,
@@ -56,7 +71,10 @@ impl Session {
             prefetch: Prefetch::default(),
             reloading: false,
             driven: false,
-            sync,
+            sync: crate::sync_radio::SyncRadio::new(&root_for_sync),
+            fixed_present: false,
+            sunlight_sent: None,
+            buzz_ends: None,
         };
         // A game left running comes straight back. Its core loads on its own thread, so start it
         // now and let the card read overlap the rest of the boot. Waiting for the first update
@@ -78,12 +96,36 @@ impl Session {
         ring.mix(&samples);
     }
 
+    fn play_print_cue(&mut self, cue: Cue) {
+        match cue {
+            Cue::Buzz => {
+                self.play_sfx(Sfx::PrintBuzz);
+                let left = Duration::from_secs_f32(Sfx::PrintBuzz.tail());
+                self.buzz_ends = Some(Instant::now() + left);
+            }
+            Cue::Tear => self.play_sfx(Sfx::Tear),
+            Cue::BuzzOff => {
+                if self
+                    .buzz_ends
+                    .take()
+                    .is_some_and(|end| Instant::now() < end)
+                {
+                    self.sink.ring().hush();
+                }
+            }
+        }
+    }
+
     pub fn audio_queued(&self) -> usize {
         self.sink.ring().queued_frames()
     }
 
     pub fn audio_ring(&self) -> std::sync::Arc<Ring> {
         self.sink.ring()
+    }
+
+    pub fn close_audio(&mut self) {
+        self.sink.close();
     }
 
     pub fn rumble(&mut self, strength: u16) {
@@ -106,12 +148,23 @@ impl Session {
         &self.app
     }
 
+    pub fn ring(&self) -> std::sync::Arc<crate::audio::Ring> {
+        self.sink.ring()
+    }
+
     pub fn app_mut(&mut self) -> &mut App {
         &mut self.app
     }
 
     pub fn emu(&self) -> Option<&EmuHandle> {
         self.emu.as_ref()
+    }
+
+    pub fn set_fixed_present(&mut self, fixed: bool) {
+        self.fixed_present = fixed;
+        if let Some(emu) = &self.emu {
+            emu.set_fixed_present(fixed);
+        }
     }
 
     pub fn set_driven(&mut self, driven: bool) {
@@ -122,9 +175,13 @@ impl Session {
     }
 
     pub fn step_emulator(&self, present: Duration, timeout: Duration) -> bool {
-        self.emu.as_ref().is_some_and(|emu| {
-            emu.tick(present);
-            emu.wait_frame(timeout)
+        let ahead = crate::ds_view::playing(self);
+        self.emu.as_ref().is_some_and(|emu| match ahead {
+            true => emu.step_ahead(present, timeout),
+            false => {
+                emu.tick(present);
+                !emu.wait_frame(timeout) && emu.locked()
+            }
         })
     }
 
@@ -133,17 +190,23 @@ impl Session {
     }
 
     pub fn core_settling(&self) -> bool {
-        self.emu
-            .as_ref()
-            .is_some_and(|e| e.state() == CoreState::Loading)
+        self.opening.is_some()
+            || self
+                .emu
+                .as_ref()
+                .is_some_and(|e| e.state() == CoreState::Loading)
     }
 
     pub fn has_core(&self) -> bool {
-        self.emu.is_some()
+        self.emu.is_some() || self.opening.is_some()
     }
 
     pub fn frame_ready(&self) -> bool {
         self.emu.as_ref().is_some_and(EmuHandle::frame_ready)
+    }
+
+    pub fn launches(&self) -> u64 {
+        self.launches
     }
 
     pub fn frames_published(&self) -> u64 {
@@ -165,7 +228,56 @@ impl Session {
     pub fn feed(&mut self, events: impl IntoIterator<Item = RawEvent>, now: Millis) {
         let mut actions = Vec::new();
         let latched = self.gestures.ff_latched();
+        self.gestures.set_context(self.app.input_context());
+        let mut entries = self.app.binding_table().entries();
+        if self.app.restart_chord() {
+            entries.insert(
+                0,
+                Entry {
+                    chord: Chord {
+                        modifier: Some(Mod::Select),
+                        button: Btn::Start,
+                    },
+                    action: Action::Restart,
+                    contexts: Contexts::ALL,
+                },
+            );
+        }
+        if self.app.repair_offered() {
+            let chord = Chord {
+                modifier: Some(Mod::Select),
+                button: Btn::Start,
+            };
+            entries.insert(
+                0,
+                Entry {
+                    chord,
+                    action: Action::RepairCard,
+                    contexts: Contexts::ALL,
+                },
+            );
+        }
+        if self.entries != entries {
+            self.gestures.set_entries(entries.clone());
+            self.entries = entries;
+        }
         for ev in events {
+            if self.app.capturing() {
+                match ev {
+                    RawEvent::Down(b) => self.captured.push(b),
+                    RawEvent::Up(b) => self.captured.retain(|x| *x != b),
+                }
+                self.gestures.observe(ev);
+                self.app.capture_input(ev);
+                continue;
+            }
+            if let RawEvent::Up(b) = ev {
+                if let Some(at) = self.captured.iter().position(|x| *x == b) {
+                    self.captured.remove(at);
+                    self.gestures.observe(ev);
+                    continue;
+                }
+            }
             actions.extend(self.gestures.feed(ev, now));
         }
         actions.extend(self.gestures.tick(now));
@@ -178,16 +290,28 @@ impl Session {
         self.sync_pad();
     }
 
-    pub fn set_menu_dpad_display(&mut self, enabled: bool) {
-        self.gestures.set_menu_dpad_display(enabled);
+    fn sync_save_sync(&mut self) {
+        let want = self.app.sync_wanted();
+        self.sync.set(want);
+        let status = if want {
+            self.sync.status()
+        } else {
+            crate::sync_radio::SyncStatus::Off
+        };
+        self.app.set_sync_status(status);
     }
 
     fn sync_pad(&mut self) {
         for btn in self.app.taken_buttons() {
-            self.pad.apply(Action::GbaUp(*btn));
+            self.pad.apply(Action::GbaUp(btn));
         }
         if let Some(emu) = &self.emu {
-            emu.set_input(self.pad.mask());
+            let mask = self.pad.mask(&self.app.controls());
+            if trace() && mask.0 != self.sent {
+                eprintln!("slot: pad {:#06x}", mask.0);
+            }
+            self.sent = mask.0;
+            emu.set_input(mask);
         }
     }
 
@@ -237,6 +361,7 @@ impl Session {
 
     pub fn update(&mut self, dt: f32) {
         self.bridge_link(|app| app.update(dt));
+        self.sink.hold_open(self.app.headphones());
         if let Some(emu) = &self.emu {
             emu.set_volume(self.app.output_volume());
         }
@@ -250,9 +375,11 @@ impl Session {
             }
         }
         let mut recoloured = false;
-        if let Some(p) = self.app.take_gb_palette() {
+        if let Some(p) = self.app.take_gb_colors() {
             if let Some(emu) = &self.emu {
-                emu.set_option("mgba_gb_colors", p.core_name());
+                for (key, value) in crate::core::palette_options(self.app.core(), p) {
+                    emu.set_option(key, value);
+                }
                 recoloured = true;
             }
         }
@@ -264,6 +391,12 @@ impl Session {
                     emu.set_option(key, value);
                     recoloured = true;
                 }
+            }
+        }
+        if let (Some(level), Some(emu)) = (self.app.sunlight(), &self.emu) {
+            if self.sunlight_sent != Some(level) {
+                emu.set_option(crate::core::SUNLIGHT_OPTION, &level.to_string());
+                self.sunlight_sent = Some(level);
             }
         }
         if recoloured && self.held() && !self.app.link_active() {
@@ -283,8 +416,12 @@ impl Session {
                 self.app.peer_lost();
             }
         }
+        self.sink.ring().set_awake(self.app.expects_sound());
         if let Some(sfx) = self.app.take_sfx() {
             self.play_sfx(sfx);
+        }
+        for cue in self.app.take_print_cues() {
+            self.play_print_cue(cue);
         }
         self.sync_save_sync();
         self.sync_core();
@@ -306,17 +443,6 @@ impl Session {
         self.sync_pad();
         let now = self.app.now();
         self.prefetch.browse(self.app.browsed_rom(), now);
-    }
-
-    fn sync_save_sync(&mut self) {
-        let want = self.app.sync_wanted();
-        self.sync.set(want);
-        let status = if want {
-            self.sync.status()
-        } else {
-            crate::sync_radio::SyncStatus::Off
-        };
-        self.app.set_sync_status(status);
     }
 
     fn sync_rumble(&mut self) {
@@ -395,7 +521,11 @@ impl Session {
     }
 
     fn held(&self) -> bool {
-        self.app.game_menu_open() || self.app.in_game_menu().is_some() || self.app.shutting_down()
+        self.app.game_menu_open()
+            || self.app.in_game_menu().is_some()
+            || self.app.repair_prompt()
+            || self.app.shutting_down()
+            || self.app.invite_card().is_some()
     }
 
     fn dozing(&self) -> bool {
@@ -408,9 +538,8 @@ impl Session {
 
     fn sync_speed(&self) {
         if let Some(emu) = &self.emu {
-            emu.set_fast_steps(u32::from(self.app.ff_speed()));
+            emu.set_fast_quarters(u32::from(self.app.ff_speed()));
             emu.set_ff_sound(self.app.ff_sound());
-            emu.set_runahead(self.app.runahead_in_play());
             emu.set_speed(
                 if self.inserting()
                     || self.ejecting()
@@ -426,7 +555,6 @@ impl Session {
                 },
             );
             emu.set_rewinding(self.actually_rewinding());
-            emu.set_turbo(self.app.turbo());
             emu.set_rewind_recording(self.app.records_rewind());
         }
     }
@@ -441,23 +569,29 @@ impl Session {
         }
         let stem = match self.app.phase() {
             Phase::Shelf => {
+                self.opening = None;
                 self.emu = None;
                 return;
             }
             Phase::Inserting { cart, .. } => cart.clone(),
             _ => return,
         };
-        if self.emu.is_none() {
+        if self.emu.is_none() && self.opening.is_none() {
             let (_, serial) = self.app.link_mode(&stem);
             self.spawn_core(&stem, serial);
+        }
+        if !self.finish_opening() {
+            return;
         }
         match self.emu.as_ref().map(EmuHandle::state) {
             Some(CoreState::Loading) => {}
             Some(CoreState::Ready) => {
-                if let (true, Some(p), Some(emu)) =
-                    (self.app.palette_live(), self.app.gb_palette(), &self.emu)
-                {
-                    emu.set_option("mgba_gb_colors", p.core_name());
+                if let (true, Some(emu)) = (self.app.palette_live(), &self.emu) {
+                    for (key, value) in
+                        crate::core::palette_options(self.app.core(), self.app.gb_colors())
+                    {
+                        emu.set_option(key, value);
+                    }
                 }
                 self.app.on_core_ready()
             }
@@ -477,7 +611,13 @@ impl Session {
         else {
             return;
         };
-        let core = slot_store::core_for_platform(&self.root, stem, platform);
+        let own = slot_store::core_for_platform(&self.root, stem, platform, self.app.gb_core());
+        let core = self
+            .app
+            .link_core()
+            .filter(|c| c.runs(platform))
+            .unwrap_or(own);
+        let switched = core != own;
         launch(&format!("opening {stem} on {}", core.as_str()));
         self.app.set_core(core);
         self.app.set_platform(platform);
@@ -485,42 +625,90 @@ impl Session {
             .set_video_mode(crate::video_mode::video_mode_for(&self.root, stem));
         self.app.set_link_loaded(serial);
         self.sync.stop_now();
-        let sav = persist::read_sav(&self.root, platform, stem);
-        let start = persist::resume_for_start(
-            &self.root,
-            platform,
-            core,
-            stem,
-            sav.as_deref(),
-            self.app.starting_clean(),
-            &slot_store::stamp_now(),
-        );
-        let resume = start.resume;
-        launch("resume state read");
+        let root = self.root.clone();
+        let stem = stem.to_owned();
+        let clean = self.app.starting_clean() || switched;
         let player = self.app.link_player();
-        let palette = crate::core::palette_for(self.app.gb_palette(), platform, &rom, player);
-        self.app.set_palette_live(palette.is_some());
-        let opened = open_core(
-            &self.root,
-            core,
-            platform,
-            serial,
-            self.app.colour_correction_for(platform),
-            palette,
-            player,
-        );
-        self.app.set_named_core(opened.named);
-        launch("core opened");
-        launch("save read");
-        let ring = self.sink.ring();
-        let emu = match player.filter(|_| platform == Platform::Gba) {
-            Some(p) => EmuHandle::spawn_linked(opened.core, rom, ring, sav, resume, p),
-            None => EmuHandle::spawn(opened.core, rom, ring, sav, resume),
+        let chosen = self.app.gb_colors();
+        let colour = self.app.colour_correction_for(platform);
+        let join = std::thread::Builder::new()
+            .name("slot-open".into())
+            .spawn(move || {
+                let sav = persist::read_sav(&root, platform, &stem);
+                let start = persist::resume_for_start(
+                    &root,
+                    platform,
+                    core,
+                    &stem,
+                    sav.as_ref().ok().and_then(|s| s.as_deref()),
+                    clean,
+                    &slot_store::stamp_now(),
+                );
+                let resume = start.resume;
+                launch("resume state read");
+                let palette = crate::core::palette_for(chosen, platform, &rom, player);
+                let mut opened = open_core(&root, core, platform, serial, colour, palette, player);
+                crate::core::apply_game_boy_player(&mut *opened.core, core, platform, &rom);
+                launch("core opened");
+                launch("save read");
+                Loaded {
+                    opened,
+                    rom,
+                    platform,
+                    player,
+                    palette_live: palette.is_some(),
+                    sav,
+                    resume,
+                    switched,
+                }
+            })
+            .ok();
+        self.opening = join.map(|join| Opening { join: Some(join) });
+    }
+
+    fn finish_opening(&mut self) -> bool {
+        let Some(opening) = &mut self.opening else {
+            return true;
         };
+        if !opening.join.as_ref().is_some_and(JoinHandle::is_finished) {
+            return false;
+        }
+        let loaded = opening.join.take().and_then(|j| j.join().ok());
+        self.opening = None;
+        let Some(loaded) = loaded else {
+            return true;
+        };
+        self.app.set_palette_live(loaded.palette_live);
+        self.app.set_named_core(loaded.opened.named);
+        let ring = self.sink.ring();
+        let sav = self.app.card_read("save", loaded.sav);
+        let resume = self.app.card_read("resume", loaded.resume);
+        let (sav_unread, resume_unread) = (sav.is_none(), resume.is_none());
+        let (core, rom, sav, resume) = (
+            loaded.opened.core,
+            loaded.rom,
+            sav.flatten(),
+            resume.flatten(),
+        );
+        let emu = match loaded.player.filter(|_| loaded.platform == Platform::Gba) {
+            Some(p) => EmuHandle::spawn_linked(core, rom, ring, sav, resume, p),
+            None => EmuHandle::spawn(core, rom, ring, sav, resume),
+        };
+        if sav_unread {
+            emu.refuse_save_ram();
+        }
+        if resume_unread || loaded.switched {
+            emu.refuse_resume();
+        }
+        self.app.set_resume_unread(resume_unread || loaded.switched);
         emu.set_volume(self.app.output_volume());
         emu.set_driven(self.driven);
+        emu.set_fixed_present(self.fixed_present);
         self.app.set_snapshot(Box::new(emu.snapshot()));
         self.emu = Some(emu);
+        self.launches += 1;
+        self.sunlight_sent = None;
+        true
     }
 
     fn reload_for_link(&mut self, stem: &str, serial: &'static str) {
@@ -528,13 +716,14 @@ impl Session {
         if self.emu.is_some() {
             self.app.flush_resume();
         }
+        self.opening = None;
         self.emu = None;
         self.spawn_core(stem, serial);
         self.reloading = true;
     }
 
     fn sync_reload(&mut self) {
-        if !self.reloading {
+        if !self.reloading || !self.finish_opening() {
             return;
         }
         match self.emu.as_ref().map(EmuHandle::state) {
@@ -551,6 +740,29 @@ impl Session {
                     self.reload_for_link(&stem, serial);
                 }
             }
+        }
+    }
+}
+
+struct Loaded {
+    opened: Opened,
+    rom: PathBuf,
+    platform: Platform,
+    player: Option<u8>,
+    palette_live: bool,
+    sav: std::io::Result<Option<Vec<u8>>>,
+    resume: std::io::Result<Option<Vec<u8>>>,
+    switched: bool,
+}
+
+struct Opening {
+    join: Option<JoinHandle<Loaded>>,
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }

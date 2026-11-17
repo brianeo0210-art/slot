@@ -30,8 +30,10 @@ pub struct Ring {
     idle: AtomicBool,
     overruns: AtomicU64,
     underruns: AtomicU64,
+    xruns: AtomicU64,
     consuming: AtomicBool,
     priming: AtomicBool,
+    awake: AtomicBool,
 }
 
 impl Ring {
@@ -54,8 +56,10 @@ impl Ring {
             muted: AtomicBool::new(false),
             overruns: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
+            xruns: AtomicU64::new(0),
             consuming: AtomicBool::new(true),
             priming: AtomicBool::new(false),
+            awake: AtomicBool::new(false),
         }
     }
 
@@ -74,6 +78,7 @@ impl Ring {
         self.rate.store(sample_rate, Ordering::Relaxed);
         self.overruns.store(0, Ordering::Relaxed);
         self.underruns.store(0, Ordering::Relaxed);
+        self.xruns.store(0, Ordering::Relaxed);
         self.consuming.store(true, Ordering::Relaxed);
         self.priming.store(false, Ordering::Relaxed);
     }
@@ -119,15 +124,37 @@ impl Ring {
     pub fn mix(&self, samples: &[i16]) {
         self.priming.store(false, Ordering::Relaxed);
         let mut i = self.lock();
-        i.pending.clear();
-        i.placed = 0;
         if i.buf.is_empty() {
+            i.pending.clear();
+            i.placed = 0;
             return;
         }
+        let mut merged = samples.to_vec();
+        if let Some(gap) = i.pending_at.checked_sub(i.drained).map(|g| g as usize) {
+            let rest = &i.pending[i.placed.min(i.pending.len())..];
+            if merged.len() < gap + rest.len() && !rest.is_empty() {
+                merged.resize(gap + rest.len(), 0);
+            }
+            for (k, s) in rest.iter().enumerate() {
+                merged[gap + k] = merged[gap + k].saturating_add(*s);
+            }
+        }
+        i.pending = merged;
+        i.placed = 0;
         i.pending_at = i.drained;
-        i.pending.extend_from_slice(samples);
         lay_pending(&mut i);
         self.queued.store(i.len, Ordering::Relaxed);
+    }
+
+    pub fn hush(&self) {
+        let mut i = self.lock();
+        i.pending = Vec::new();
+        i.placed = 0;
+        let cap = i.buf.len();
+        for k in 0..i.len {
+            let at = (i.head + k) % cap;
+            i.buf[at] = 0;
+        }
     }
 
     pub fn fill(&self, out: &mut [i16]) {
@@ -176,9 +203,18 @@ impl Ring {
         self.underruns.load(Ordering::Relaxed)
     }
 
+    pub fn note_xrun(&self) {
+        self.xruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xruns(&self) -> u64 {
+        self.xruns.load(Ordering::Relaxed)
+    }
+
     pub fn clear_faults(&self) {
         self.overruns.store(0, Ordering::Relaxed);
         self.underruns.store(0, Ordering::Relaxed);
+        self.xruns.store(0, Ordering::Relaxed);
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -192,6 +228,14 @@ impl Ring {
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
         self.room.notify_all();
+    }
+
+    pub fn set_awake(&self, awake: bool) {
+        self.awake.store(awake, Ordering::Relaxed);
+    }
+
+    pub fn awake(&self) -> bool {
+        self.awake.load(Ordering::Relaxed)
     }
 
     pub fn muted(&self) -> bool {

@@ -1,13 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use slot_retro::{LibretroCore, MockCore, RetroCore};
-use slot_store::{Core, GbPalette, Platform};
+use slot_store::{Core, GbColors, Platform};
 
 use crate::root;
 
+pub use slot_store::SUNLIGHT_MAX;
+
 const CORE_ENV: &str = "SLOT_CORE";
 
+pub const SUNLIGHT_OPTION: &str = "mgba_solar_sensor_level";
+const SUNLIGHT_NOON: i64 = 8;
+
 pub fn dylib_name(core: Core) -> String {
+    #[cfg(feature = "nds")]
+    if core == Core::Dsperate {
+        return format!("slot_ds.{}", std::env::consts::DLL_EXTENSION);
+    }
     format!(
         "{}_libretro.{}",
         core.as_str(),
@@ -37,16 +46,21 @@ pub struct Opened {
     pub named: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open_core(
     root: &Path,
     core: Core,
     platform: Platform,
     serial: &str,
     colour: bool,
-    palette: Option<GbPalette>,
+    palette: Option<GbColors>,
     link: Option<u8>,
 ) -> Opened {
     let paths = candidates(root, core);
+    #[cfg(feature = "nds")]
+    if core == Core::Dsperate {
+        return open_ds(root, &paths);
+    }
     match open_named(root, core, platform, serial, colour, palette, link, &paths) {
         Some(core) => Opened { core, named: true },
         None => {
@@ -56,6 +70,28 @@ pub fn open_core(
                 named: false,
             }
         }
+    }
+}
+
+#[cfg(feature = "nds")]
+fn open_ds(root: &Path, paths: &[PathBuf]) -> Opened {
+    let bios = root::bios_dir(root);
+    for path in paths.iter().filter(|p| p.exists()) {
+        match slot_retro::DsperateCore::open(path, &bios) {
+            Ok(core) => {
+                eprintln!("slot: core {}", path.display());
+                return Opened {
+                    core: Box::new(core),
+                    named: true,
+                };
+            }
+            Err(e) => eprintln!("slot: {}: {e}", path.display()),
+        }
+    }
+    report_missing(Core::Dsperate, paths);
+    Opened {
+        core: Box::new(MockCore::with_size(slot_retro::DS_W, slot_retro::DS_H)),
+        named: false,
     }
 }
 
@@ -75,7 +111,7 @@ pub fn open_core_for_palette(
     platform: Platform,
     serial: &str,
     colour: bool,
-    palette: Option<GbPalette>,
+    palette: Option<GbColors>,
     paths: &[PathBuf],
 ) -> Box<dyn RetroCore> {
     open_named(root, core, platform, serial, colour, palette, None, paths).unwrap_or_else(|| {
@@ -91,7 +127,7 @@ fn open_named(
     platform: Platform,
     serial: &str,
     colour: bool,
-    palette: Option<GbPalette>,
+    palette: Option<GbColors>,
     link: Option<u8>,
     paths: &[PathBuf],
 ) -> Option<Box<dyn RetroCore>> {
@@ -101,7 +137,7 @@ fn open_named(
         if !path.exists() {
             continue;
         }
-        match LibretroCore::open_with(path, &bios, &saves) {
+        match LibretroCore::open_preset(path, &bios, &saves, init_options(core)) {
             Ok(mut opened) => {
                 apply_core_options(
                     &mut opened,
@@ -112,6 +148,7 @@ fn open_named(
                     colour,
                     palette,
                 );
+                apply_blending_off(&mut opened, core);
                 if let Some(player) = link {
                     apply_link_options(&mut opened, core, player);
                 }
@@ -125,12 +162,12 @@ fn open_named(
 }
 
 pub fn palette_for(
-    chosen: Option<GbPalette>,
+    chosen: GbColors,
     platform: Platform,
     rom: &Path,
     link: Option<u8>,
-) -> Option<GbPalette> {
-    chosen.filter(|_| link.is_none() && platform != Platform::Gba && dmg_only(rom))
+) -> Option<GbColors> {
+    (link.is_none() && platform.hardware() != Platform::Gba && dmg_only(rom)).then_some(chosen)
 }
 
 pub fn dmg_only(rom: &Path) -> bool {
@@ -159,6 +196,8 @@ pub fn colour_option(
     on: bool,
 ) -> Option<(&'static str, &'static str)> {
     match which {
+        #[cfg(feature = "nds")]
+        Core::Dsperate => None,
         Core::Mgba => Some((
             "mgba_color_correction",
             if on && platform == Platform::Gb {
@@ -173,7 +212,54 @@ pub fn colour_option(
             "gpsp_color_correction",
             if on { "enabled" } else { "disabled" },
         )),
+        Core::Gambatte => Some((
+            "gambatte_gbc_color_correction",
+            if !on {
+                "disabled"
+            } else if platform == Platform::Gb {
+                "always"
+            } else {
+                "GBC only"
+            },
+        )),
     }
+}
+
+pub fn game_boy_player(platform: Platform, rom: &Path) -> bool {
+    platform == Platform::Gba
+        && !slot_store::header_code(rom).is_some_and(|code| code.starts_with('M'))
+}
+
+pub fn apply_game_boy_player(
+    core: &mut dyn RetroCore,
+    which: Core,
+    platform: Platform,
+    rom: &Path,
+) {
+    if which == Core::Mgba {
+        let on = game_boy_player(platform, rom);
+        core.set_option("mgba_force_gbp", if on { "ON" } else { "OFF" });
+    }
+}
+
+pub fn sunlight_at(local_secs: i64) -> u8 {
+    let from_noon = (local_secs.rem_euclid(86_400) / 60 - 720).abs();
+    (SUNLIGHT_NOON * (360 - from_noon) / 360).max(0) as u8
+}
+
+pub fn blending_off(which: Core) -> (&'static str, &'static str) {
+    match which {
+        Core::Mgba => ("mgba_interframe_blending", "OFF"),
+        Core::Gpsp => ("gpsp_frame_mixing", "disabled"),
+        Core::Gambatte => ("gambatte_mix_frames", "disabled"),
+        #[cfg(feature = "nds")]
+        Core::Dsperate => ("dsperate_blending", "off"),
+    }
+}
+
+pub fn apply_blending_off(core: &mut LibretroCore, which: Core) {
+    let (key, value) = blending_off(which);
+    core.set_option(key, value);
 }
 
 pub fn apply_link_options(core: &mut LibretroCore, which: Core, player: u8) {
@@ -185,6 +271,27 @@ pub fn apply_link_options(core: &mut LibretroCore, which: Core, player: u8) {
     eprintln!("slot: core: link mode on, player {player}");
 }
 
+pub fn palette_options(which: Core, colors: GbColors) -> Vec<(&'static str, &'static str)> {
+    match (which, colors) {
+        (Core::Gambatte, GbColors::Palette(p)) => vec![
+            ("gambatte_gb_colorization", "internal"),
+            ("gambatte_gb_internal_palette", p.gambatte_name()),
+        ],
+        (Core::Gambatte, GbColors::Auto) => vec![("gambatte_gb_colorization", "GBC")],
+        _ => vec![("mgba_gb_colors", colors.core_name())],
+    }
+}
+
+fn init_options(core: Core) -> &'static [(&'static str, &'static str)] {
+    match core {
+        Core::Gambatte => &[
+            ("gambatte_gb_bootloader", "enabled"),
+            ("gambatte_rumble_level", "10"),
+        ],
+        _ => &[],
+    }
+}
+
 pub fn apply_core_options(
     core: &mut LibretroCore,
     which: Core,
@@ -192,12 +299,13 @@ pub fn apply_core_options(
     serial: &str,
     bios: bool,
     colour: bool,
-    palette: Option<GbPalette>,
+    palette: Option<GbColors>,
 ) {
-    core.set_option(&format!("{}_frameskip", which.as_str()), "auto");
+    if which != Core::Gambatte {
+        core.set_option(&format!("{}_frameskip", which.as_str()), "auto");
+    }
     if which == Core::Mgba {
         core.set_option("mgba_sgb_borders", "OFF");
-        core.set_option("mgba_force_gbp", "ON");
         match palette {
             Some(p) => {
                 core.set_option("mgba_gb_model", "Game Boy");
@@ -209,6 +317,15 @@ pub fn apply_core_options(
                 core.set_option("mgba_gb_colors_preset", "1");
                 core.set_option("mgba_gb_colors", "GBC Dark Green →A");
             }
+        }
+        if let Some((key, value)) = colour_option(which, platform, colour) {
+            core.set_option(key, value);
+        }
+    }
+    if which == Core::Gambatte {
+        core.set_option("gambatte_gb_hwmode", "Auto");
+        for (key, value) in palette_options(which, palette.unwrap_or(GbColors::Auto)) {
+            core.set_option(key, value);
         }
         if let Some((key, value)) = colour_option(which, platform, colour) {
             core.set_option(key, value);
@@ -232,6 +349,59 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn palette_options_are_spelled_per_core() {
+        let p = slot_store::GbPalette::parse("SGB 1-A").unwrap();
+        assert_eq!(
+            palette_options(Core::Mgba, GbColors::Palette(p)),
+            vec![("mgba_gb_colors", "SGB 1-A")]
+        );
+        assert_eq!(
+            palette_options(Core::Mgba, GbColors::Auto),
+            vec![("mgba_gb_colors", "Auto")]
+        );
+        assert_eq!(
+            palette_options(Core::Gambatte, GbColors::Palette(p)),
+            vec![
+                ("gambatte_gb_colorization", "internal"),
+                ("gambatte_gb_internal_palette", "SGB - 1A")
+            ]
+        );
+        assert_eq!(
+            palette_options(Core::Gambatte, GbColors::Auto),
+            vec![("gambatte_gb_colorization", "GBC")]
+        );
+    }
+
+    #[test]
+    fn gambatte_spells_blending_off_and_color_correction() {
+        assert_eq!(
+            blending_off(Core::Gambatte),
+            ("gambatte_mix_frames", "disabled")
+        );
+        assert_eq!(
+            colour_option(Core::Gambatte, Platform::Gbc, true),
+            Some(("gambatte_gbc_color_correction", "GBC only"))
+        );
+        assert_eq!(
+            colour_option(Core::Gambatte, Platform::Gb, true),
+            Some(("gambatte_gbc_color_correction", "always"))
+        );
+        assert_eq!(
+            colour_option(Core::Gambatte, Platform::Gb, false),
+            Some(("gambatte_gbc_color_correction", "disabled"))
+        );
+    }
+
+    #[test]
+    fn each_core_spells_frame_blending_off_its_own_way() {
+        assert_eq!(
+            blending_off(Core::Mgba),
+            ("mgba_interframe_blending", "OFF")
+        );
+        assert_eq!(blending_off(Core::Gpsp), ("gpsp_frame_mixing", "disabled"));
+    }
 
     #[test]
     fn each_core_spells_colour_correction_its_own_way() {

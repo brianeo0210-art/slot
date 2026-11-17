@@ -21,10 +21,17 @@ pub enum Icon {
     Charging,
     Headphones,
     HeadphonesMuted,
+    Camera,
+    Sunlight,
+    Backspace,
+    Return,
+    Shift,
+    Space,
+    Kid,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 12] = [
+    pub const ALL: [Icon; 19] = [
         Icon::Volume,
         Icon::VolumeZero,
         Icon::VolumeMuted,
@@ -37,6 +44,13 @@ impl Icon {
         Icon::Charging,
         Icon::Headphones,
         Icon::HeadphonesMuted,
+        Icon::Camera,
+        Icon::Sunlight,
+        Icon::Backspace,
+        Icon::Return,
+        Icon::Shift,
+        Icon::Space,
+        Icon::Kid,
     ];
 
     pub fn index(self) -> usize {
@@ -57,6 +71,13 @@ impl Icon {
             Icon::Charging => '\u{f0e7}',
             Icon::Headphones => '\u{f025}',
             Icon::HeadphonesMuted => '\u{f07ce}',
+            Icon::Camera => '\u{f030}',
+            Icon::Sunlight => '\u{f0a72}',
+            Icon::Backspace => '\u{f0b5c}',
+            Icon::Return => '\u{f0311}',
+            Icon::Shift => '\u{f0636}',
+            Icon::Space => '\u{f1050}',
+            Icon::Kid => '\u{f18fb}',
         }
     }
 }
@@ -64,7 +85,18 @@ impl Icon {
 const HALO: [u8; 3] = [0x08, 0x08, 0x0a];
 pub const HALO_PX: u32 = 1;
 
+pub const WARNING_INK: [u8; 3] = [0xff, 0xb8, 0x2e];
+
 pub fn haloed(cov: &[u8], cw: u32, ch: u32, colour: [u8; 3]) -> CartFace {
+    haloed_with(cov, cw, ch, |_, _| colour)
+}
+
+pub fn haloed_with(
+    cov: &[u8],
+    cw: u32,
+    ch: u32,
+    colour_at: impl Fn(isize, isize) -> [u8; 3],
+) -> CartFace {
     let pad = HALO_PX as usize;
     let (cw, ch) = (cw as usize, ch as usize);
     let (w, h) = (cw + 2 * pad, ch + 2 * pad);
@@ -88,6 +120,7 @@ pub fn haloed(cov: &[u8], cw: u32, ch: u32, colour: [u8; 3]) -> CartFace {
                 }
             }
             if ink > 0 {
+                let colour = colour_at(gx, gy);
                 let a = ink as u32;
                 let inv = 255 - a;
                 let mix = |c: u8, s: u8| ((c as u32 * a + s as u32 * inv) / 255) as u8;
@@ -142,24 +175,23 @@ impl Badge {
     }
 }
 
-const STAR: [&str; 9] = [
-    "....#....",
-    "...###...",
-    "...###...",
+const HEART: [&str; 8] = [
+    ".##...##.",
+    "####.####",
+    "#########",
     "#########",
     ".#######.",
     "..#####..",
-    "..#####..",
-    ".###.###.",
-    ".##...##.",
+    "...###...",
+    "....#....",
 ];
 
-pub fn star_face(scale: u32, colour: [u8; 3]) -> CartFace {
-    let (gw, gh) = (STAR[0].len() as i32, STAR.len() as i32);
+pub fn heart_face(scale: u32, colour: [u8; 3]) -> CartFace {
+    let (gw, gh) = (HEART[0].len() as i32, HEART.len() as i32);
     let ink = |x: i32, y: i32| {
         (0..gw).contains(&x)
             && (0..gh).contains(&y)
-            && STAR[y as usize].as_bytes()[x as usize] == b'#'
+            && HEART[y as usize].as_bytes()[x as usize] == b'#'
     };
     let (w, h) = ((gw + 2) as u32 * scale, (gh + 2) as u32 * scale);
     let mut rgba = vec![0u8; (w * h * 4) as usize];
@@ -213,6 +245,10 @@ struct Raster {
 }
 
 type Cache = Mutex<HashMap<(Icon, u32), Arc<Raster>>>;
+
+pub(crate) fn icon_coverage(icon: Icon, px: f32) -> Option<(Vec<u8>, u32, u32)> {
+    raster(icon, px).map(|r| (r.cov.clone(), r.w, r.h))
+}
 
 fn raster(icon: Icon, px: f32) -> Option<Arc<Raster>> {
     static CACHE: OnceLock<Cache> = OnceLock::new();

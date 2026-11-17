@@ -1,11 +1,19 @@
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod device;
 mod motor;
 mod power;
 mod sim;
 
 pub use device::{
-    card_kernel_lines, has_bit, motor_change, read_only, read_only_in, record_first_frame,
-    rumble_node, trace_first_frame, uptime_seconds, DevicePlatform,
+    card_kernel_lines, card_mount_in, has_bit, motor_change, read_only, read_only_in,
+    record_first_frame, rumble_node, stage_repair, take_repair_result, trace_first_frame,
+    uptime_seconds, usb_card, CardMount, DevicePlatform, SOUND_CARDS,
 };
 pub use motor::Motor;
 pub use power::Power;
@@ -29,6 +37,13 @@ pub struct Battery {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RepairResult {
+    Repaired,
+    Clean,
+    Failed,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum LedState {
     Off,
     Running,
@@ -39,6 +54,9 @@ pub enum LedState {
 
 pub trait Platform: Send {
     fn set_backlight(&mut self, step: u8);
+
+    fn set_bottom_backlight(&mut self, _on: bool) {}
+
     fn battery(&self) -> Option<Battery>;
     fn charge(&self) -> Charge;
     fn set_led(&mut self, state: LedState);
@@ -47,11 +65,16 @@ pub trait Platform: Send {
     fn root(&self) -> &Path;
     fn now(&self) -> i64;
     fn set_clock(&mut self, secs: i64);
+
+    fn set_network_time(&mut self, _on: bool) {}
+
     fn set_rumble(&mut self, strength: u16);
 
     fn relink_adb(&mut self) -> bool {
         false
     }
+
+    fn sleep(&mut self) {}
 
     fn headphones(&self) -> bool {
         false
@@ -67,6 +90,14 @@ pub trait Platform: Send {
 
     fn card_kernel_lines(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    fn repair_card(&mut self) -> ! {
+        self.restart()
+    }
+
+    fn take_repair_result(&mut self) -> Option<RepairResult> {
+        None
     }
 }
 

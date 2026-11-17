@@ -3,8 +3,10 @@
 # Syncthing. Slot runs this only while you are on the shelf and stops it before a
 # game starts, so it never shares the CPU with a running game.
 #
-#   sync.sh start     join Wi-Fi from System/wifi.conf and start Syncthing
-#   sync.sh stop      stop Syncthing and let go of the Wi-Fi
+#   sync.sh start     start Syncthing once the Wi-Fi is up. The Wi-Fi is the one slot
+#                     joins from its Network menu (Config/wifi.conf). Cards that only
+#                     have System/wifi.conf get the old way: this script joins it.
+#   sync.sh stop      stop Syncthing (and let go of a Wi-Fi this script joined)
 #   sync.sh status    print one word: off starting running no-binary no-wifi no-ip error
 #   sync.sh pair [S]  for S seconds (default 120) accept the first device that asks
 #   sync.sh id        print this device's Syncthing ID
@@ -25,6 +27,8 @@ WAIT_IP="${SYNC_WAIT_IP:-60}"
 STATE="$RUN/slot-sync.state"
 PIDF="$RUN/slot-sync.pid"
 WANT="$RUN/slot-sync.want"
+JOINED="$RUN/slot-sync.joined"
+SLOT_WIFI="$SD/Config/wifi.conf"
 IDF="$RUN/slot-sync.id"
 LOGS="$SD/Logs"
 LOG="$LOGS/sync.log"
@@ -149,18 +153,29 @@ start() {
 		return 0
 	fi
 	[ -x "$ST" ] || [ -f "$ST" ] || { say no-binary; return 1; }
-	[ -f "$SYS/wifi.conf" ] || { say no-wifi; return 1; }
+	# Wi-Fi comes from slot's own Network menu when it has a saved network, else from
+	# System/wifi.conf.
+	slot_wifi=0
+	grep -q '^[[:space:]]*network=' "$SLOT_WIFI" 2>/dev/null && slot_wifi=1
+	if [ "$slot_wifi" -eq 0 ] && ! has_ip && [ ! -f "$SYS/wifi.conf" ]; then
+		say no-wifi
+		return 1
+	fi
 	say starting
 	: > "$WANT"
 	pick_home
 
 	if ! has_ip; then
 		inventory
-		if [ -x "$NETCTL" ]; then
+		if [ "$slot_wifi" -eq 1 ]; then
+			dbg "waiting for slot's own Wi-Fi"
+		elif [ -x "$NETCTL" ]; then
+			: > "$JOINED"
 			dbg "joining wifi with $NETCTL"
 			"$NETCTL" wifi >> "$DBG" 2>&1
 			dbg "ags-net wifi returned $?"
 		else
+			: > "$JOINED"
 			join_wifi
 		fi
 		dbg "ip: $($IPBIN -4 addr show wlan0 2>&1 | grep inet)"
@@ -230,8 +245,9 @@ stop() {
 		[ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
 	fi
 	rm -f "$PIDF"
-	# Let go of the Wi-Fi unless the card asked for the network at boot.
-	if [ ! -f "$SD/System/network.on" ] && [ ! -f "$SD/System/ssh.on" ]; then
+	# Let go of the Wi-Fi only if this script was the one that joined it.
+	if [ -f "$JOINED" ]; then
+		rm -f "$JOINED"
 		$WPA_CLI -i wlan0 terminate >/dev/null 2>&1
 		$IPBIN addr flush dev wlan0 >/dev/null 2>&1
 	fi

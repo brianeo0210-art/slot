@@ -6,16 +6,31 @@ pub enum Platform {
     Gba,
     Gb,
     Gbc,
+    Gbav,
+    #[cfg(feature = "nds")]
+    Nds,
 }
 
 impl Platform {
-    pub const ALL: [Platform; 3] = [Platform::Gba, Platform::Gb, Platform::Gbc];
+    #[cfg(not(feature = "nds"))]
+    pub const ALL: [Platform; 4] = [Platform::Gba, Platform::Gbav, Platform::Gbc, Platform::Gb];
+    #[cfg(feature = "nds")]
+    pub const ALL: [Platform; 5] = [
+        Platform::Nds,
+        Platform::Gba,
+        Platform::Gbav,
+        Platform::Gbc,
+        Platform::Gb,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Platform::Gba => "Game Boy Advance",
             Platform::Gb => "Game Boy",
             Platform::Gbc => "Game Boy Color",
+            Platform::Gbav => "Game Boy Advance Video",
+            #[cfg(feature = "nds")]
+            Platform::Nds => "Nintendo DS",
         }
     }
 
@@ -24,20 +39,34 @@ impl Platform {
             Platform::Gba => "GBA",
             Platform::Gb => "GB",
             Platform::Gbc => "GBC",
+            Platform::Gbav => "GBAV",
+            #[cfg(feature = "nds")]
+            Platform::Nds => "NDS",
+        }
+    }
+
+    pub fn hardware(self) -> Platform {
+        match self {
+            Platform::Gbav => Platform::Gba,
+            p => p,
         }
     }
 
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
-            Platform::Gba => &["gba"],
+            Platform::Gba | Platform::Gbav => &["gba"],
             Platform::Gb | Platform::Gbc => &["gb", "gbc"],
+            #[cfg(feature = "nds")]
+            Platform::Nds => &["nds"],
         }
     }
 
     pub fn picture(self) -> (u32, u32) {
         match self {
-            Platform::Gba => (240, 160),
+            Platform::Gba | Platform::Gbav => (240, 160),
             Platform::Gb | Platform::Gbc => (160, 144),
+            #[cfg(feature = "nds")]
+            Platform::Nds => (256, 192),
         }
     }
 

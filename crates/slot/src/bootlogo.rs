@@ -5,6 +5,7 @@ use std::process::Command;
 
 pub const CARD_LOGO: &str = "System/bootlogo.bmp";
 pub const USER_LOGO: &str = "Config/bootlogo.bmp";
+pub const INSTALLED_COPY: &str = "Cache/bootlogo.installed";
 const LOGO: &str = "bootlogo.bmp";
 const ORIGINAL: &str = "bootlogo.baseos.bmp";
 const PARTITION: &str = "boot-resource";
@@ -123,21 +124,56 @@ pub fn compose(wordmark: &Bmp, (width, height): (usize, usize)) -> Option<Bmp> {
     Some(Bmp { width, height, rgb })
 }
 
-pub fn install(wordmark: &[u8], dir: &Path) -> io::Result<Outcome> {
-    let Some(mark) = decode(wordmark) else {
-        return Ok(Outcome::Invalid);
-    };
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Logo {
+    Exact(Vec<u8>),
+    Wordmark(Vec<u8>),
+}
+
+struct Plan {
+    logo: Vec<u8>,
+    current: Option<Vec<u8>>,
+    original: Option<Vec<u8>>,
+}
+
+fn built(logo: &Logo, current: Option<&[u8]>, original: Option<&[u8]>) -> Option<Vec<u8>> {
+    match logo {
+        Logo::Exact(bytes) => Some(bytes.clone()),
+        Logo::Wordmark(bytes) => {
+            let mark = decode(bytes)?;
+            let panel = original.or(current).and_then(size)?;
+            compose(&mark, panel).map(|b| encode(&b))
+        }
+    }
+}
+
+fn plan(logo: &Logo, dir: &Path) -> Result<Plan, Outcome> {
     let current = fs::read(dir.join(LOGO)).ok();
     let original = fs::read(dir.join(ORIGINAL)).ok();
-    let Some(panel) = original.as_deref().or(current.as_deref()).and_then(size) else {
-        return Ok(Outcome::Invalid);
-    };
-    let Some(logo) = compose(&mark, panel).map(|b| encode(&b)) else {
-        return Ok(Outcome::Invalid);
-    };
+    let logo = built(logo, current.as_deref(), original.as_deref()).ok_or(Outcome::Invalid)?;
     if current.as_deref() == Some(&logo[..]) {
-        return Ok(Outcome::Same);
+        return Err(Outcome::Same);
     }
+    Ok(Plan {
+        logo,
+        current,
+        original,
+    })
+}
+
+pub fn pending(logo: &Logo, dir: &Path) -> Option<Outcome> {
+    plan(logo, dir).err()
+}
+
+pub fn install(logo: &Logo, dir: &Path) -> io::Result<Outcome> {
+    let Plan {
+        logo,
+        current,
+        original,
+    } = match plan(logo, dir) {
+        Ok(plan) => plan,
+        Err(outcome) => return Ok(outcome),
+    };
     if let Some(current) = &current {
         if original.is_none() {
             replace(dir, ORIGINAL, current)?;
@@ -167,17 +203,35 @@ fn replace(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-pub fn chosen(card: &Path) -> Option<Vec<u8>> {
-    for name in [USER_LOGO, CARD_LOGO] {
-        let Ok(logo) = fs::read(card.join(name)) else {
-            continue;
-        };
-        if decode(&logo).is_some() {
-            return Some(logo);
-        }
-        eprintln!("slot: bootlogo: {name} is not a 24-bit bmp, skipping it");
+pub fn chosen(card: &Path) -> Option<Logo> {
+    if let Ok(logo) = fs::read(card.join(USER_LOGO)) {
+        return Some(Logo::Exact(logo));
     }
-    None
+    let shipped = fs::read(card.join(CARD_LOGO)).ok()?;
+    if decode(&shipped).is_none() {
+        eprintln!("slot: bootlogo: {CARD_LOGO} is not a 24-bit bmp, skipping it");
+        return None;
+    }
+    Some(Logo::Wordmark(shipped))
+}
+
+pub fn remember(card: &Path) {
+    let user = card.join(USER_LOGO);
+    let source = if user.is_file() {
+        user
+    } else {
+        card.join(CARD_LOGO)
+    };
+    let Ok(logo) = fs::read(source) else {
+        return;
+    };
+    let copy = card.join(INSTALLED_COPY);
+    let (Some(dir), Some(name)) = (copy.parent(), copy.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    if let Err(e) = fs::create_dir_all(dir).and_then(|_| replace(dir, name, &logo)) {
+        eprintln!("slot: bootlogo: could not keep the installed copy: {e}");
+    }
 }
 
 pub fn refresh(card: &Path) {
@@ -189,16 +243,22 @@ pub fn refresh(card: &Path) {
         return;
     };
     if fs::create_dir_all(MOUNT).is_err()
-        || !run("mount", &["-t", "vfat", "-o", "rw,noatime", &device, MOUNT])
+        || !run("mount", &["-t", "vfat", "-o", "ro,noatime", &device, MOUNT])
     {
         eprintln!("slot: bootlogo: could not mount {device}");
         return;
     }
-    match install(&logo, Path::new(MOUNT)) {
-        Ok(Outcome::Installed) => eprintln!("slot: bootlogo: installed"),
-        Ok(Outcome::Invalid) => eprintln!("slot: bootlogo: no logo fits this panel, left alone"),
-        Ok(_) => {}
-        Err(e) => eprintln!("slot: bootlogo: {e}"),
+    match pending(&logo, Path::new(MOUNT)) {
+        Some(Outcome::Invalid) => eprintln!("slot: bootlogo: no logo fits this panel, left alone"),
+        Some(_) => {}
+        None if !run("mount", &["-o", "remount,rw,noatime", MOUNT]) => {
+            eprintln!("slot: bootlogo: could not remount {device} to write the logo")
+        }
+        None => match install(&logo, Path::new(MOUNT)) {
+            Ok(Outcome::Installed) => eprintln!("slot: bootlogo: installed"),
+            Ok(_) => {}
+            Err(e) => eprintln!("slot: bootlogo: {e}"),
+        },
     }
     if !run("umount", &[MOUNT]) {
         eprintln!("slot: bootlogo: could not unmount {MOUNT}");

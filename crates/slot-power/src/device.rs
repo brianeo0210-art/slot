@@ -5,12 +5,12 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{Battery, Charge, LedState, Platform};
+use crate::{Battery, Charge, LedState, Platform, RepairResult};
 
-const TOP_STEP: u32 = 9;
+const TOP_STEP: u32 = 10;
 
 const BACKLIGHT_FLOOR: f64 = 8.0 / 255.0;
 
@@ -22,7 +22,19 @@ const RUN_DIR: &str = "/run";
 
 const CARD_LOG: &str = "/data/slot-card.log";
 
+const REPAIR_SCRIPT: &str = "repair.sh";
+
+const FSCK_EXFAT: &str = "fsck.exfat";
+
+const REPAIR_STAGE: &str = "/tmp/slot-repair";
+
+const REPAIR_RESULT: &str = "/data/slot-repair.result";
+
+const TIMEDATECTL: &str = "/usr/bin/timedatectl";
+
 const WIFI_MODULE: &str = "8821cs";
+
+const WIFI_UNLOAD_WAIT: Duration = Duration::from_secs(5);
 
 const KERNEL_LINES: usize = 40;
 
@@ -75,7 +87,7 @@ const EVIOCSFF: c_ulong = 0x4030_4580;
 const DISPDBG_MAX: u32 = 255;
 
 enum Backlight {
-    Class(PathBuf),
+    Class(Vec<(PathBuf, u32)>),
     Dispdbg(PathBuf),
 }
 
@@ -87,30 +99,49 @@ enum Led {
 pub struct DevicePlatform {
     root: PathBuf,
     sysfs: PathBuf,
+    sound_cards: PathBuf,
     backlight: Option<Backlight>,
     max_brightness: u32,
     battery: Option<PathBuf>,
     rtc: Option<PathBuf>,
     motor: Option<Motor>,
     led: Option<Led>,
+    sleep_command: Option<PathBuf>,
+    sleeping: Option<Child>,
 }
 
 impl DevicePlatform {
     pub fn new(root: PathBuf) -> Self {
-        DevicePlatform::probe(Path::new("/sys"), root)
+        let platform = DevicePlatform::probe(Path::new("/sys"), root);
+        match std::env::var_os("DSOS_SLEEP") {
+            Some(cmd) if !cmd.is_empty() => platform.with_sleep(PathBuf::from(cmd)),
+            _ => platform,
+        }
+    }
+
+    pub fn with_sleep(mut self, command: PathBuf) -> Self {
+        self.sleep_command = Some(command);
+        self
+    }
+
+    pub fn with_sound_cards(mut self, cards: PathBuf) -> Self {
+        self.sound_cards = cards;
+        self
     }
 
     pub fn probe(sysfs: &Path, root: PathBuf) -> Self {
-        let class = first_dir(&sysfs.join("class/backlight"), |d| {
-            d.join("brightness").is_file()
-        });
-        let max_brightness = class
-            .as_ref()
-            .and_then(|d| read_number(&d.join("max_brightness")))
-            .unwrap_or(DISPDBG_MAX);
-        let backlight = match class {
-            Some(dir) => Some(Backlight::Class(dir)),
-            None => {
+        let class: Vec<(PathBuf, u32)> = all_dirs(&sysfs.join("class/backlight"))
+            .into_iter()
+            .filter(|d| d.join("brightness").is_file())
+            .map(|d| {
+                let max = read_number(&d.join("max_brightness")).unwrap_or(DISPDBG_MAX);
+                (d, max)
+            })
+            .collect();
+        let max_brightness = class.first().map_or(DISPDBG_MAX, |(_, max)| *max);
+        let backlight = match class.is_empty() {
+            false => Some(Backlight::Class(class)),
+            true => {
                 let dbg = sysfs.join("kernel/debug/dispdbg");
                 dbg.join("param")
                     .is_file()
@@ -121,7 +152,10 @@ impl DevicePlatform {
         let rtc = first_dir(&sysfs.join("class/rtc"), |_| true);
         let motor = Motor::open(sysfs);
         let led = first_dir(&sysfs.join("class/leds"), |d| {
-            d.join("multi_intensity").is_file() || d.join("brightness").is_file()
+            let charging = d
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("charging"));
+            !charging && (d.join("multi_intensity").is_file() || d.join("brightness").is_file())
         })
         .map(|dir| {
             if dir.join("multi_intensity").is_file() {
@@ -134,12 +168,15 @@ impl DevicePlatform {
         DevicePlatform {
             root,
             sysfs: sysfs.to_path_buf(),
+            sound_cards: PathBuf::from(SOUND_CARDS),
             backlight,
             max_brightness,
             battery,
             rtc,
             motor,
             led,
+            sleep_command: None,
+            sleeping: None,
         }
     }
 
@@ -172,7 +209,11 @@ impl DevicePlatform {
             None => absent.to_string(),
         };
         let backlight = match &self.backlight {
-            Some(Backlight::Class(dir)) => leaf(dir),
+            Some(Backlight::Class(dirs)) => dirs
+                .iter()
+                .map(|(dir, _)| leaf(dir))
+                .collect::<Vec<_>>()
+                .join(" and "),
             Some(Backlight::Dispdbg(_)) => "dispdbg".to_string(),
             None => "no backlight".to_string(),
         };
@@ -279,6 +320,53 @@ struct FfEvent {
 #[cfg(unix)]
 extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn dup2(old: c_int, new: c_int) -> c_int;
+}
+
+const F_GETFD: c_int = 1;
+const F_SETFD: c_int = 2;
+const FD_CLOEXEC: c_int = 1;
+
+fn unload_wifi() {
+    let Ok(mut rmmod) = Command::new("rmmod").arg(WIFI_MODULE).spawn() else {
+        return;
+    };
+    let until = Instant::now() + WIFI_UNLOAD_WAIT;
+    while Instant::now() < until {
+        if !matches!(rmmod.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn release_logs() {
+    #[cfg(unix)]
+    if let Ok(null) = fs::OpenOptions::new().write(true).open("/dev/null") {
+        unsafe {
+            dup2(null.as_raw_fd(), 1);
+            dup2(null.as_raw_fd(), 2);
+        }
+    }
+}
+
+fn close_on_exec() {
+    let Ok(fds) = fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    let fds: Vec<c_int> = fds
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in fds {
+        unsafe {
+            let flags = fcntl(fd, F_GETFD);
+            if flags >= 0 {
+                fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+            }
+        }
+    }
 }
 
 fn upload(node: &fs::File, id: i16) -> Option<i16> {
@@ -370,14 +458,16 @@ impl Drop for Motor {
     }
 }
 
-fn first_dir(parent: &Path, keep: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+fn all_dirs(parent: &Path) -> Vec<PathBuf> {
     let mut names: Vec<PathBuf> = fs::read_dir(parent)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect();
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
     names.sort();
-    names.into_iter().find(|p| keep(p))
+    names
+}
+
+fn first_dir(parent: &Path, keep: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    all_dirs(parent).into_iter().find(|p| keep(p))
 }
 
 fn is_battery(dir: &Path) -> bool {
@@ -401,6 +491,16 @@ fn charge_at(dir: &Path) -> Charge {
     }
 }
 
+pub const SOUND_CARDS: &str = "/proc/asound/cards";
+
+pub fn usb_card(cards: &str) -> Option<u32> {
+    cards.lines().find_map(|line| {
+        let (index, rest) = line.trim_start().split_once(' ')?;
+        let index = index.parse().ok()?;
+        rest.contains("USB-Audio").then_some(index)
+    })
+}
+
 fn headphones_in(gpio: &str) -> bool {
     gpio.lines()
         .find(|l| l.contains("|Headphone detection"))
@@ -420,8 +520,25 @@ fn backlight_value(step: u8, max: u32) -> u32 {
 }
 
 impl Platform for DevicePlatform {
+    fn sleep(&mut self) {
+        let Some(command) = &self.sleep_command else {
+            return;
+        };
+        if let Some(child) = &mut self.sleeping {
+            if matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+        }
+        match Command::new(command).spawn() {
+            Ok(child) => self.sleeping = Some(child),
+            Err(e) => eprintln!("slot: sleep {}: {e}", command.display()),
+        }
+    }
+
     fn headphones(&self) -> bool {
-        fs::read_to_string(self.sysfs.join("kernel/debug/gpio")).is_ok_and(|g| headphones_in(&g))
+        let jack = fs::read_to_string(self.sysfs.join("kernel/debug/gpio"))
+            .is_ok_and(|g| headphones_in(&g));
+        jack || fs::read_to_string(&self.sound_cards).is_ok_and(|c| usb_card(&c).is_some())
     }
 
     fn card_read_only(&self) -> bool {
@@ -443,20 +560,40 @@ impl Platform for DevicePlatform {
         let Some(backlight) = &self.backlight else {
             return;
         };
-        let value = backlight_value(step, self.max_brightness);
         let write = |file: PathBuf, body: String| {
             if let Err(e) = fs::write(&file, body) {
                 eprintln!("slot: {}: {e}", file.display());
             }
         };
         match backlight {
-            Backlight::Class(dir) => write(dir.join("brightness"), value.to_string()),
+            Backlight::Class(dirs) => {
+                for (dir, max) in dirs {
+                    write(
+                        dir.join("brightness"),
+                        backlight_value(step, *max).to_string(),
+                    );
+                }
+            }
             Backlight::Dispdbg(dir) => {
+                let value = backlight_value(step, self.max_brightness);
                 write(dir.join("name"), "lcd0".to_string());
                 write(dir.join("command"), "setbl".to_string());
                 write(dir.join("param"), value.to_string());
                 write(dir.join("start"), "1".to_string());
             }
+        }
+    }
+
+    fn set_bottom_backlight(&mut self, on: bool) {
+        let Some(Backlight::Class(dirs)) = &self.backlight else {
+            return;
+        };
+        let [(bottom, _), _] = dirs.as_slice() else {
+            return;
+        };
+        let file = bottom.join("bl_power");
+        if let Err(e) = fs::write(&file, if on { "0" } else { "4" }) {
+            eprintln!("slot: {}: {e}", file.display());
         }
     }
 
@@ -499,22 +636,59 @@ impl Platform for DevicePlatform {
     }
 
     fn restart(&mut self) -> ! {
-        self.breadcrumb("restart: reached slot, unloading the WiFi driver");
-        let _ = Command::new("rmmod").arg(WIFI_MODULE).status();
-        self.breadcrumb("restart: WiFi driver unloaded, about to sync");
+        self.breadcrumb("restart: reached slot, syncing before the WiFi driver unloads");
+        let _ = Command::new("sync").status();
+        unload_wifi();
+        self.breadcrumb("restart: WiFi driver unloaded or given up on, about to sync");
         let _ = Command::new("sync").status();
         self.breadcrumb("restart: sync returned, about to signal init");
+        release_logs();
         let _ = Command::new("reboot").status();
         std::thread::sleep(Duration::from_secs(10));
         std::process::exit(0)
     }
 
+    fn repair_card(&mut self) -> ! {
+        let mount = fs::read_to_string("/proc/mounts")
+            .ok()
+            .and_then(|m| card_mount_in(&m, &self.root));
+        match (mount, stage_repair(&self.root, Path::new(REPAIR_STAGE))) {
+            (Some(m), Ok(script)) => {
+                close_on_exec();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let e = Command::new("/bin/sh")
+                        .arg(&script)
+                        .arg(&m.device)
+                        .arg(&m.point)
+                        .arg(&m.fs)
+                        .exec();
+                    eprintln!("slot: repair: {e}");
+                }
+            }
+            (None, _) => eprintln!(
+                "slot: repair: no block device under {}",
+                self.root.display()
+            ),
+            (_, Err(e)) => eprintln!("slot: repair: {e}"),
+        }
+        self.restart()
+    }
+
+    fn take_repair_result(&mut self) -> Option<RepairResult> {
+        take_repair_result(Path::new(REPAIR_RESULT))
+    }
+
     fn poweroff(&mut self) -> ! {
-        self.breadcrumb("poweroff: reached slot, about to sync");
+        self.breadcrumb("poweroff: reached slot, syncing before the WiFi driver unloads");
+        let _ = Command::new("sync").status();
+        unload_wifi();
+        self.breadcrumb("poweroff: WiFi driver unloaded or given up on, about to sync");
         let _ = Command::new("sync").status();
         self.breadcrumb("poweroff: sync returned, about to signal init");
+        release_logs();
         let _ = Command::new("poweroff").status();
-        self.breadcrumb("poweroff: signalled init, waiting for it to take the machine down");
         std::thread::sleep(Duration::from_secs(10));
         std::process::exit(0)
     }
@@ -531,14 +705,11 @@ impl Platform for DevicePlatform {
     }
 
     fn set_clock(&mut self, secs: i64) {
-        ran(
-            "date",
-            Command::new("date").arg(format!("-s@{secs}")).status(),
-        );
-        ran(
-            "hwclock",
-            Command::new("hwclock").args(["-w", "-u"]).status(),
-        );
+        write_clock(secs);
+    }
+
+    fn set_network_time(&mut self, on: bool) {
+        std::thread::spawn(move || set_ntp(on));
     }
 
     fn relink_adb(&mut self) -> bool {
@@ -593,15 +764,103 @@ pub fn card_kernel_lines(dmesg: &str) -> Vec<String> {
     lines.into_iter().skip(skip).collect()
 }
 
-pub fn read_only_in(mounts: &str, path: &Path) -> bool {
+struct MountLine<'a> {
+    device: &'a str,
+    point: &'a Path,
+    fs: &'a str,
+    options: &'a str,
+}
+
+fn closest_mount<'a>(mounts: &'a str, path: &Path) -> Option<MountLine<'a>> {
     mounts
         .lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
-            let point = Path::new(f.nth(1)?);
-            let options = f.nth(1)?;
-            path.starts_with(point).then_some((point, options))
+            let device = f.next()?;
+            let point = Path::new(f.next()?);
+            let fs = f.next()?;
+            let options = f.next()?;
+            path.starts_with(point).then_some(MountLine {
+                device,
+                point,
+                fs,
+                options,
+            })
         })
-        .max_by_key(|(point, _)| point.as_os_str().len())
-        .is_some_and(|(_, options)| options.split(',').any(|o| o == "ro"))
+        .max_by_key(|m| m.point.as_os_str().len())
+}
+
+pub fn read_only_in(mounts: &str, path: &Path) -> bool {
+    closest_mount(mounts, path).is_some_and(|m| m.options.split(',').any(|o| o == "ro"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardMount {
+    pub device: String,
+    pub point: PathBuf,
+    pub fs: String,
+}
+
+pub fn card_mount_in(mounts: &str, path: &Path) -> Option<CardMount> {
+    let m = closest_mount(mounts, path)?;
+    m.device.starts_with("/dev/").then(|| CardMount {
+        device: m.device.to_owned(),
+        point: m.point.to_path_buf(),
+        fs: m.fs.to_owned(),
+    })
+}
+
+pub fn stage_repair(root: &Path, stage: &Path) -> std::io::Result<PathBuf> {
+    let system = root.join("System");
+    fs::create_dir_all(stage)?;
+    let script = stage.join(REPAIR_SCRIPT);
+    fs::copy(system.join(REPAIR_SCRIPT), &script)?;
+    let fsck = system.join(FSCK_EXFAT);
+    if fsck.exists() {
+        let staged = stage.join(FSCK_EXFAT);
+        fs::copy(&fsck, &staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(script)
+}
+
+pub fn take_repair_result(file: &Path) -> Option<RepairResult> {
+    let text = fs::read_to_string(file).ok()?;
+    let _ = fs::remove_file(file);
+    Some(match text.trim() {
+        "repaired" => RepairResult::Repaired,
+        "clean" => RepairResult::Clean,
+        _ => RepairResult::Failed,
+    })
+}
+
+fn set_ntp(on: bool) {
+    let want = if on { "yes" } else { "no" };
+    let now = Command::new(TIMEDATECTL)
+        .args(["show", "-p", "NTP", "--value"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if now.as_deref() == Some(want) {
+        return;
+    }
+    ran(
+        "timedatectl set-ntp",
+        Command::new(TIMEDATECTL).args(["set-ntp", want]).status(),
+    );
+}
+
+fn write_clock(secs: i64) {
+    ran(
+        "date",
+        Command::new("date").arg(format!("-s@{secs}")).status(),
+    );
+    ran(
+        "hwclock",
+        Command::new("hwclock").args(["-w", "-u"]).status(),
+    );
 }

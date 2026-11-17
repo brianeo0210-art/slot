@@ -68,6 +68,38 @@ impl GbPalette {
         NAMES[self.index()]
     }
 
+    pub fn gambatte_name(self) -> &'static str {
+        const GBC: [&str; 12] = [
+            "GBC - Brown",
+            "GBC - Red",
+            "GBC - Dark Brown",
+            "GBC - Pastel Mix",
+            "GBC - Orange",
+            "GBC - Yellow",
+            "GBC - Blue",
+            "GBC - Dark Blue",
+            "GBC - Grayscale",
+            "GBC - Green",
+            "GBC - Dark Green",
+            "GBC - Inverted",
+        ];
+        const SGB: [&str; 32] = [
+            "SGB - 1A", "SGB - 1B", "SGB - 1C", "SGB - 1D", "SGB - 1E", "SGB - 1F", "SGB - 1G",
+            "SGB - 1H", "SGB - 2A", "SGB - 2B", "SGB - 2C", "SGB - 2D", "SGB - 2E", "SGB - 2F",
+            "SGB - 2G", "SGB - 2H", "SGB - 3A", "SGB - 3B", "SGB - 3C", "SGB - 3D", "SGB - 3E",
+            "SGB - 3F", "SGB - 3G", "SGB - 3H", "SGB - 4A", "SGB - 4B", "SGB - 4C", "SGB - 4D",
+            "SGB - 4E", "SGB - 4F", "SGB - 4G", "SGB - 4H",
+        ];
+        match self.index() {
+            0 => "GBC - Grayscale",
+            1 => "GB - DMG",
+            2 => "GB - Pocket",
+            3 => "GB - Light",
+            i @ 4..=15 => GBC[i - 4],
+            i => SGB[i - 16],
+        }
+    }
+
     pub fn label(self) -> &'static str {
         let name = self.core_name();
         match name.find(['↑', '↓', '←', '→']) {
@@ -86,5 +118,54 @@ impl GbPalette {
 
     pub fn parse(name: &str) -> Option<GbPalette> {
         Self::all().find(|p| p.core_name() == name)
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum GbColors {
+    Auto,
+    Palette(GbPalette),
+}
+
+impl GbColors {
+    pub fn all() -> impl Iterator<Item = GbColors> {
+        std::iter::once(GbColors::Auto).chain(GbPalette::all().map(GbColors::Palette))
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            GbColors::Auto => 0,
+            GbColors::Palette(p) => p.index() + 1,
+        }
+    }
+
+    pub fn next(self) -> GbColors {
+        match self {
+            GbColors::Auto => GbColors::Palette(GbPalette(0)),
+            GbColors::Palette(p) if p.index() + 1 == GbPalette::COUNT => GbColors::Auto,
+            GbColors::Palette(p) => GbColors::Palette(p.next()),
+        }
+    }
+
+    pub fn prev(self) -> GbColors {
+        match self {
+            GbColors::Auto => GbColors::Palette(GbPalette((GbPalette::COUNT - 1) as u8)),
+            GbColors::Palette(p) if p.index() == 0 => GbColors::Auto,
+            GbColors::Palette(p) => GbColors::Palette(p.prev()),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GbColors::Auto => "Auto",
+            GbColors::Palette(p) => p.label(),
+        }
+    }
+
+    pub fn core_name(self) -> &'static str {
+        match self {
+            GbColors::Auto => "Auto",
+            GbColors::Palette(p) => p.core_name(),
+        }
     }
 }
